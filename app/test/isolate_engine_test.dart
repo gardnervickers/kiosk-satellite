@@ -49,6 +49,39 @@ void main() {
       expect(buf.absSamples, 20 * 1280);
     });
 
+    test('pins post-wake speech after the rolling window has moved on', () {
+      final buf = PreRollBuffer();
+      buf.add(pcm(1280, value: 1)); // wake word
+      buf.pinFrom(1280);
+      for (var i = 0; i < 20; i++) {
+        buf.add(pcm(1280, value: i + 2));
+      }
+      expect(samplesIn(buf.flush(null)), 8 * 1280);
+      final handoff = buf.takeHandoff();
+      expect(samplesIn(handoff), 20 * 1280);
+      expect(ByteData.sublistView(handoff.first).getInt16(0, Endian.little), 2);
+      expect(ByteData.sublistView(handoff.last).getInt16(0, Endian.little), 21);
+      expect(buf.hasHandoff, isFalse);
+    });
+
+    test('reports an evicted wake boundary and a bounded handoff overflow', () {
+      final old = PreRollBuffer(maxChunks: 2);
+      for (var i = 0; i < 3; i++) { old.add(pcm(1280)); }
+      old.pinFrom(0);
+      expect(old.takeHandoff, throwsStateError);
+      expect(old.takeHandoff, throwsStateError,
+          reason: 'a retry must not silently fall back to the rolling ring');
+
+      final full = PreRollBuffer(maxHandoffSamples: 2560);
+      full.pinFrom(0);
+      for (var i = 0; i < 3; i++) { full.add(pcm(1280)); }
+      expect(full.takeHandoff, throwsStateError);
+      expect(full.takeHandoff, throwsStateError);
+      expect(full.hasHandoff, isTrue);
+      full.clearHandoff();
+      expect(full.hasHandoff, isFalse);
+    });
+
     test('a null trim point yields everything buffered', () {
       // A manual wake or start_conversation: no wake word was spoken, so there
       // is nothing to trim and the full pre-roll is the useful answer.
@@ -370,6 +403,44 @@ void main() {
           reason: 'what survives is the command, not the wake word');
       expect(flags, everyElement(isTrue),
           reason: 'replayed audio must be flagged so live meters skip it');
+    });
+
+    test('delayed page handoff preserves a one-shot command beyond 640 ms', () async {
+      await start();
+      await feed(1280, value: 3); // wake word
+      await engine.fireDetection(wakeEndSample: 1280);
+      for (var i = 0; i < 12; i++) { await feed(1280, value: i + 10); }
+      final chunks = <Uint8List>[];
+      await engine.startAudioStream((pcm, preRoll) {
+        expect(preRoll, isTrue);
+        chunks.add(pcm);
+      });
+      expect(samplesIn(chunks), 12 * 1280);
+      expect(ByteData.sublistView(chunks.first).getInt16(0, Endian.little), 10);
+      expect(ByteData.sublistView(chunks.last).getInt16(0, Endian.little), 21);
+    });
+
+    test('failed replay detaches its callback and fails a retry', () async {
+      await start();
+      await engine.fireDetection(wakeEndSample: 0);
+      await feed(1280);
+      var calls = 0;
+      await expectLater(engine.startAudioStream((_, _) {
+        calls++;
+        throw StateError('consumer failed');
+      }), throwsStateError);
+      await feed(1280);
+      expect(calls, 1, reason: 'a failed stream must not keep receiving live mic');
+      await expectLater(engine.startAudioStream((_, _) {}), throwsStateError);
+    });
+
+    test('handoff cap failure remains explicit on retry', () async {
+      await start();
+      await engine.fireDetection(wakeEndSample: 0);
+      for (var i = 0; i < 126; i++) { await feed(1280); }
+      await expectLater(engine.startAudioStream((_, _) {}), throwsStateError);
+      await engine.stopAudioStream();
+      await expectLater(engine.startAudioStream((_, _) {}), throwsStateError);
     });
 
     test('live audio after the stream opens is not flagged as pre-roll',

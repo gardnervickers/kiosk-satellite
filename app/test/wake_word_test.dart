@@ -25,6 +25,7 @@ const _granted = 1;
 class _FakeEngine extends WakeWordEngine {
   bool _running = false;
   bool streamOpen = false;
+  bool failStream = false;
 
   @override
   Set<WakeWordEngineType> get supportedEngines => const {
@@ -53,6 +54,7 @@ class _FakeEngine extends WakeWordEngine {
   Future<void> startAudioStream(
     void Function(Uint8List pcm, bool preRoll) onChunk,
   ) async {
+    if (failStream) throw StateError('wake handoff lost');
     streamOpen = true;
   }
 
@@ -520,6 +522,47 @@ void main() {
         async.flushMicrotasks();
         expect(isActive, isTrue);
         expect(engine.streamOpen, isTrue, reason: 'resuming never closes it');
+      });
+    });
+
+    test('failed native audio open does not keep the turn marked streaming', () {
+      fakeAsync((async) {
+        commands.execute('simulateWakeWord', const {});
+        async.flushMicrotasks();
+        engine.failStream = true;
+        Object? failure;
+        wakeWord.openNativeAudioStream((_, _) {}).catchError((Object error) {
+          failure = error;
+          return false;
+        });
+        async.flushMicrotasks();
+        expect(failure, isA<StateError>());
+        expect(engine.streamOpen, isFalse);
+
+        async.elapse(const Duration(seconds: 1));
+        var isActive = false;
+        active().then((value) => isActive = value);
+        async.flushMicrotasks();
+        expect(isActive, isTrue, reason: 'self-heal is not held by a stale sink');
+      });
+    });
+
+    test('failed page audio open does not keep the turn marked streaming', () {
+      fakeAsync((async) {
+        commands.execute('simulateWakeWord', const {});
+        async.flushMicrotasks();
+        engine.failStream = true;
+        CommandResult? result;
+        commands.execute('startAudioStream', const {}).then((value) => result = value);
+        async.flushMicrotasks();
+        expect(result?.ok, isFalse);
+        expect(engine.streamOpen, isFalse);
+
+        async.elapse(const Duration(seconds: 1));
+        var isActive = false;
+        active().then((value) => isActive = value);
+        async.flushMicrotasks();
+        expect(isActive, isTrue, reason: 'self-heal is not held by a stale page stream');
       });
     });
 

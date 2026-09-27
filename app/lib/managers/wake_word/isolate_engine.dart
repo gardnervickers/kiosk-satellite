@@ -38,11 +38,17 @@ class PreRollChunk {
 /// clock shared with the compute isolate: a detection reports the absolute
 /// sample the wake word ended on, which indexes straight back into here.
 class PreRollBuffer {
-  PreRollBuffer({this.maxChunks = 8}); // 8 x 80 ms = 640 ms
+  PreRollBuffer({this.maxChunks = 8, this.maxHandoffSamples = 160000});
+  // The ordinary ring is 8 x 80 ms = 640 ms. A detected turn may need longer
+  // while the page wakes; cap its separate handoff at ten seconds of 16 kHz PCM.
 
   final int maxChunks;
+  final int maxHandoffSamples;
   final List<PreRollChunk> _chunks = [];
   int _absSamples = 0;
+  List<Uint8List>? _handoff;
+  int _handoffSamples = 0;
+  bool _handoffLost = false;
 
   /// Samples seen from the mic since the last [reset].
   int get absSamples => _absSamples;
@@ -50,9 +56,54 @@ class PreRollBuffer {
   void add(Uint8List bytes) {
     _chunks.add(PreRollChunk(_absSamples, bytes));
     _absSamples += bytes.length ~/ 2; // PCM16
+    if (_handoff != null && !_handoffLost) {
+      _handoff!.add(bytes);
+      _handoffSamples += bytes.length ~/ 2;
+      if (_handoffSamples > maxHandoffSamples) {
+        _handoff!.clear();
+        _handoffLost = true;
+      }
+    }
     while (_chunks.length > maxChunks) {
       _chunks.removeAt(0);
     }
+  }
+
+  /// Pin post-wake samples before asynchronous screen/network handoff begins.
+  /// A missing wake boundary or a full cap is reported when streaming starts,
+  /// rather than silently sending a truncated one-shot command.
+  void pinFrom(int sample) {
+    _handoffLost = sample < (_chunks.isEmpty ? _absSamples : _chunks.first.startSample)
+        || sample > _absSamples;
+    _handoff = _handoffLost ? <Uint8List>[] : flush(sample);
+    _handoffSamples = _handoff!.fold(0, (sum, pcm) => sum + pcm.length ~/ 2);
+    if (_handoffSamples > maxHandoffSamples) {
+      _handoff!.clear();
+      _handoffLost = true;
+    }
+  }
+
+  List<Uint8List> takeHandoff() {
+    if (_handoffLost) {
+      throw StateError('Wake audio handoff exceeded the buffer; please repeat your request');
+    }
+    final chunks = _handoff;
+    clearHandoff();
+    return chunks ?? const <Uint8List>[];
+  }
+
+  bool get hasHandoff => _handoff != null;
+
+  void invalidateHandoff() {
+    _handoff = <Uint8List>[];
+    _handoffSamples = 0;
+    _handoffLost = true;
+  }
+
+  void clearHandoff() {
+    _handoff = null;
+    _handoffSamples = 0;
+    _handoffLost = false;
   }
 
   /// Buffered audio at or after [from], oldest first. A null [from] yields
@@ -76,6 +127,7 @@ class PreRollBuffer {
   void reset() {
     _chunks.clear();
     _absSamples = 0;
+    clearHandoff();
   }
 }
 
@@ -431,6 +483,7 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
     _isolatePort
         ?.send({'type': WakeMsg.resume, 'absSample': _preRoll.absSamples});
     _wakeEndSample = null;
+    _preRoll.clearHandoff();
     _detectionPaused = false;
     log.info(tag, 'detection re-armed');
   }
@@ -438,7 +491,6 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
   @override
   Future<void> startAudioStream(
       void Function(Uint8List pcm, bool preRoll) onChunk) async {
-    _onAudioChunk = onChunk;
     // Flush the pre-roll first so the caller gets the audio captured between
     // the wake word firing and this call, otherwise the start of the user's
     // command is lost. Flagged as pre-roll: it is past audio, so live renderers
@@ -448,10 +500,21 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
     // one-shot phrases work ("okay nabu turn off the lights"): to the wake end
     // when the engine can align it, otherwise to the detection instant.
     final wakeEnd = _wakeEndSample;
+    _onAudioChunk = null;
+    final chunks = _preRoll.hasHandoff
+        ? _preRoll.takeHandoff()
+        : _preRoll.flush(wakeEnd);
+    _onAudioChunk = onChunk;
     var samples = 0;
-    for (final pcm in _preRoll.flush(wakeEnd)) {
-      samples += pcm.length ~/ 2;
-      onChunk(pcm, true);
+    try {
+      for (final pcm in chunks) {
+        samples += pcm.length ~/ 2;
+        onChunk(pcm, true);
+      }
+    } catch (_) {
+      _onAudioChunk = null;
+      _preRoll.invalidateHandoff();
+      rethrow;
     }
     log.info(
         tag,
@@ -572,6 +635,7 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
     // Fall back to "now": an engine that cannot align its match still must not
     // replay the wake word, and detection never precedes the wake word ending.
     _wakeEndSample = msg['wakeEndSample'] as int? ?? _preRoll.absSamples;
+    _preRoll.pinFrom(_wakeEndSample!);
     // Keep the mic open — we are the audio source for the turn (the card
     // streams PCM from us instead of opening its own mic, which is what makes
     // wake -> STT instant and loses no speech). Just stop detecting.

@@ -1038,7 +1038,12 @@ class WakeWordManager extends Manager
               return const CommandResult.fail('engine not running');
             }
             _pageAudioActive = true;
-            await _openPageAudioStream();
+            try {
+              await _openPageAudioStream();
+            } catch (_) {
+              _pageAudioActive = false;
+              rethrow;
+            }
             return const CommandResult.ok({'sampleRate': 16000});
           },
         ),
@@ -1398,7 +1403,12 @@ class WakeWordManager extends Manager
   ) async {
     if (!_engine.running) return false;
     _nativeAudioSink = onChunk;
-    await _engine.startAudioStream(onChunk);
+    try {
+      await _engine.startAudioStream(onChunk);
+    } catch (_) {
+      _nativeAudioSink = null;
+      rethrow;
+    }
     return true;
   }
 
