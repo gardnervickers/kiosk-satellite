@@ -340,6 +340,13 @@ class WakeWordManager extends Manager
   /// null when it is not recording (no tester open, diagnostics off).
   Uint8List? recentAudio(Duration length) => _engine.recentAudio(length);
 
+  /// Start a user-requested clip at this instant, excluding prior room audio.
+  bool beginTrainingClip() {
+    if (!_engine.running || _testers == 0) return false;
+    _engine.clearRecentAudio();
+    return true;
+  }
+
   /// Point the active engine's telemetry at our stream (or unhook it).
   /// Re-run whenever the running engine changes, so requesting a test
   /// before the engine is up — or across an engine switch — still lands on
@@ -1555,6 +1562,13 @@ class WakeWordManager extends Manager
     WakeWordModelRef model, {
     bool simulated = false,
   }) async {
+    // A detection already in flight when a tester opens may arrive after its
+    // suppression message. The engine paused itself before this callback;
+    // restore its prior listening state without starting a voice turn.
+    if (_testers > 0) {
+      if (_active && !_intercomHold) await _engine.resumeDetection();
+      return;
+    }
     // The engine has already paused detection and kept the mic — it is the
     // audio source for the turn the page is about to run.
     _active = false;

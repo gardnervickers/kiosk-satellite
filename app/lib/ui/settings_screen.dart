@@ -64,6 +64,7 @@ import 'subpage_icons.dart';
 import 'shizuku_settings.dart';
 import '../managers/wake_word/permission_descriptions.dart';
 import 'wake_word_tester.dart';
+import 'wake_training.dart';
 import 'wake_activations.dart';
 import 'update_helper_settings.dart';
 import 'plugin_settings.dart';
@@ -3818,6 +3819,7 @@ class _CategoryContentState extends State<_CategoryContent> {
                   child: SettingsCard(
                     children: [
                       WakeWordTesterTile(container: container),
+                      WakeTrainingTile(container: container),
                       // Diagnostics answers the same question after the
                       // fact, so its page opens from the tester's group.
                       if (container.settings.visible(wakeWordDiagnostics))

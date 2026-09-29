@@ -25,6 +25,12 @@ To review activations after they happen, turn on **Enable wake word diagnostics*
 
 The **Microphone level** row at the bottom of Microphone settings shows the same level without the tester. It opens the microphone itself when no wake word engine is running, so it also works before Voice Satellite has started. A bar that never moves means no audio reaches the app and the app log says why.
 
+## Record Hey Luna Training Clips
+
+Open **Settings > Voice Satellite > Wake Word Tester > Record wake-word examples** on the kiosk. The screen pauses real wake actions while it is open and keeps the existing wake microphone running. Tap **Record 4 seconds**, then say “Hey Luna” at a normal distance, or record other speech and room sounds. Recording starts when tapped and excludes earlier microphone audio. Replay each draft, choose **Hey Luna** or **Other speech or background**, and save or discard it. Closing the screen restores the previous wake behavior. A failed or interrupted recording is not saved.
+
+Saved examples remain on this device in a separate collection from wake-word diagnostics. The collection holds up to 200 clips and does not rotate or delete them automatically. Each 16 kHz mono WAV has a JSON sidecar with its label, recording time, device name, and the per-install Sendspin identity when available. **Export all clips as ZIP** opens Android's share sheet with one archive; share it to your chosen destination before deleting local clips. Recording and exporting do not train or activate a model.
+
 ## Capture Mode
 
 This setting determines which of Android's internal microphone audio paths the app records from.

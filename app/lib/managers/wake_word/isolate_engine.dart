@@ -243,6 +243,9 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
   Uint8List? recentAudio(Duration length) =>
       _recent?.last(length.inMilliseconds * 16);
 
+  @override
+  void clearRecentAudio() => _recent?.clear();
+
   Map<String, Object?>? _lastDetection;
 
   void Function(WakeWordModelRef, Map<String, Object?>)? _onNearMiss;
@@ -590,6 +593,7 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
   Future<void> stop() async {
     if (!_running && _isolate == null) return;
     _running = false;
+    _recent?.clear();
     await _audioSub?.cancel();
     _audioSub = null;
 

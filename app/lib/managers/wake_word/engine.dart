@@ -324,6 +324,9 @@ abstract class WakeWordEngine {
   /// PCM16, or null when nothing is being recorded.
   Uint8List? recentAudio(Duration length) => null;
 
+  /// Discard audio heard before an explicit recording starts.
+  void clearRecentAudio() {}
+
   /// Near misses as the detector spots them: a wake word that scored within
   /// reach of its threshold and fell back without firing, with its peak
   /// score and threshold in [detail]. Always reported by engines that can;
