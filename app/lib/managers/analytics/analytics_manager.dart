@@ -11,9 +11,12 @@ import 'package:http/http.dart' as http;
 import '../../core/command_registry.dart';
 import '../../core/events.dart';
 import '../../core/manager.dart';
+import '../alarms/alarm_model.dart';
 import '../settings/definitions.dart' as defs;
 import '../settings/settings_manager.dart';
 import '../update/update_http_client.dart';
+import '../voice/wake_catalog.dart';
+import '../wake_word/engine.dart';
 import 'analytics_scrub.dart';
 import 'crash_journal.dart';
 
@@ -54,8 +57,8 @@ class AnalyticsManager extends Manager {
   static const _sentCrashesKey = 'analytics_sent_crashes';
   static const _vsSeenKey = 'analytics_vs_seen';
 
-  /// How long a Voice Satellite sighting keeps an install reading
-  /// 'installed' while the page hook is not answering.
+  /// How long a Voice Satellite sighting keeps a dashboard runtime reading
+  /// 'integration' while the page hook is not answering.
   static const vsMemory = Duration(days: 7);
 
   /// How many crashes one tick reports at most: a journal that holds a
@@ -454,28 +457,95 @@ class AnalyticsManager extends Manager {
 
     // What Voice Satellite is listening for and with: the wake word
     // manager's state. Names only; a model name is a catalog label, not
-    // the user's audio.
+    // the user's audio. A native runtime picks the engine itself, so its
+    // setting names it whether the engine is muted or not, and a released
+    // engine means nothing more than that. On the dashboard runtime a
+    // released engine means the page took detection to Home Assistant.
+    // Native voice that is off reports nothing: whatever the engine last
+    // loaded is not what the kiosk listens for.
+    final native = s.get(defs.voiceRuntime) == 'native';
+    final nativeOn = native && s.get(defs.voiceEnabled);
     var wakeEngine = '';
     var wakeWord = '';
     var wakeWord2 = '';
-    try {
-      final r = await commands.execute('getWakeWordState', const {});
-      final data = r.data;
-      if (data is Map) {
-        wakeEngine = data['released'] == true
-            ? 'home_assistant'
-            : '${data['engineLabel'] ?? data['engine'] ?? ''}';
-        final models = data['models'];
-        if (models is List) {
-          String word(int i) => models.length > i && models[i] is Map
-              ? '${(models[i] as Map)['wakeWord'] ?? ''}'
-              : '';
-          wakeWord = word(0);
-          wakeWord2 = word(1);
+    if (nativeOn) {
+      wakeEngine =
+          (voiceEngines[s.get(defs.voiceWakeWordEngine)] ??
+                  WakeWordEngineType.vsWakeWord)
+              .label;
+    }
+    if (!native || nativeOn) {
+      try {
+        final r = await commands.execute('getWakeWordState', const {});
+        final data = r.data;
+        if (data is Map) {
+          if (!native) {
+            wakeEngine = data['released'] == true
+                ? 'home_assistant'
+                : '${data['engineLabel'] ?? data['engine'] ?? ''}';
+          }
+          final models = data['models'];
+          if (models is List) {
+            String word(int i) => models.length > i && models[i] is Map
+                ? '${(models[i] as Map)['wakeWord'] ?? ''}'
+                : '';
+            wakeWord = word(0);
+            wakeWord2 = word(1);
+          }
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
     final vs = await _voiceSatellite(configPushed: wakeEngine.isNotEmpty);
+
+    // The native satellite's own settings: switches and picks, and how
+    // many custom wake word models the kiosk holds. The speaker the
+    // answers play on and Home Assistant's Assistant picks are names, so
+    // they read as kinds and a yes or no.
+    var customWakeWords = 0;
+    if (nativeOn) {
+      try {
+        final r = await commands.execute('customWakeModels', const {});
+        final data = r.data;
+        if (data is Map && data['models'] is List) {
+          customWakeWords = (data['models'] as List).length;
+        }
+      } catch (_) {}
+    }
+    final nativeVoice = <String, Object?>{
+      if (nativeOn) ...{
+        'vs_muted': s.get(defs.voiceMute),
+        'vs_theme': s.get(defs.voiceTheme),
+        'vs_wake_word_sensitivity': s.get(defs.voiceWakeWordSensitivity),
+        'wake_word_custom': customWakeWords,
+        'vs_noise_gate': s.get(defs.voiceNoiseGate),
+        'vs_stop_word': s.get(defs.voiceStopWord),
+        'vs_seamless_wake': s.get(defs.voiceSeamlessWake),
+        'vs_followup': s.get(defs.voiceFollowupDelayMs) > 0,
+        'vs_finished_speaking': s.get(defs.voiceHaVadSensitivity),
+        'vs_second_assistant': s.get(defs.voiceHaPipeline2).trim().isNotEmpty,
+        'vs_tts_output': s.get(defs.voiceTtsOutput).trim().isEmpty
+            ? 'device'
+            : s.get(defs.voiceTtsOutputMode),
+        'vs_wake_sound': s.get(defs.voiceWakeSound),
+        'vs_custom_chimes': [
+          s.get(defs.voiceChimeWake),
+          s.get(defs.voiceChimeDone),
+          s.get(defs.voiceChimeError),
+          s.get(defs.voiceChimeTimer),
+          s.get(defs.voiceChimeAnnounce),
+        ].where((c) => c.trim().isNotEmpty).length,
+        'vs_reactive_bar': s.get(defs.voiceReactiveBar),
+        'vs_show_command': s.get(defs.voiceShowCommand),
+        'vs_show_answer': s.get(defs.voiceShowAnswer),
+        'vs_show_tools': s.get(defs.voiceShowTools),
+        'vs_timer_pills': s.get(defs.voiceTimerPills),
+        'vs_timer_speak': s.get(defs.voiceTimerSpeak),
+      },
+    };
+
+    // Alarms: how many the kiosk holds and of what kind, as counts. The
+    // times, labels and tone files stay on the kiosk.
+    final alarms = decodeAlarms(s.get(defs.alarmsList));
 
     // Who installs updates: Android itself for a device owner, the ADB
     // update helper, Shizuku, or the on-screen confirmation. Shizuku's own
@@ -518,11 +588,25 @@ class AnalyticsManager extends Manager {
       'wake_on_person': s.get(defs.screensaverDismissOnPerson),
       'wake_on_proximity': s.get(defs.screensaverDismissOnProximity),
       'voice_satellite': vs.state,
-      'native_pipeline': s.get(defs.vsNativePipeline),
+      // The native satellite runs every turn itself; the switch is the
+      // dashboard runtime's.
+      'native_pipeline': native || s.get(defs.vsNativePipeline),
       'wake_word_engine': wakeEngine,
       'wake_word': wakeWord,
       'wake_word_2': wakeWord2,
       'vs_skin': vs.skin,
+      ...nativeVoice,
+      'alarms': alarms.length,
+      'alarms_on': alarms.where((a) => a.on).length,
+      'alarms_repeating': alarms.where((a) => a.repeats).length,
+      'alarms_sunrise': alarms.where((a) => a.sunrise).length,
+      'alarms_menu': s.get(defs.alarmsMenu),
+      'alarms_tone': s.get(defs.alarmsTone).trim().isEmpty
+          ? 'built_in'
+          : 'custom',
+      'alarms_snooze_minutes': s.get(defs.alarmsSnoozeMinutes),
+      'alarms_silence_after_minutes': s.get(defs.alarmsSilenceAfterMinutes),
+      'alarms_sunrise_minutes': s.get(defs.alarmsSunriseMinutes),
       'esphome': s.get(defs.esphomeEnabled),
       'bluetooth_proxy': s.get(defs.btproxyEnabled),
       'gps_sensor': s.get(defs.locationEnabled),
@@ -576,17 +660,23 @@ class AnalyticsManager extends Manager {
     };
   }
 
-  /// Voice Satellite as the page reports it. The hook the integration
-  /// puts on every Home Assistant page answers only where it is
-  /// installed, so an answer settles both questions: 'running' or
-  /// 'stopped', by the engine. No answer, while the page is mid-load or
-  /// showing something else, says nothing on its own, so an install that
-  /// received a wake word config this session or heard the hook within
-  /// the last week reads 'installed', and anything else 'not_installed'.
-  /// The skin rides along from the same answer.
+  /// How this kiosk does voice: 'native' (the app's own satellite, turned
+  /// on), 'integration' (the Voice Satellite integration in the dashboard)
+  /// or 'off'. A native runtime answers from its own switch and skin. A
+  /// dashboard runtime asks the hook the integration puts on every Home
+  /// Assistant page, which answers only where it is installed. No answer,
+  /// while the page is mid-load or showing something else, says nothing on
+  /// its own, so an install that received a wake word config this session
+  /// or heard the hook within the last week still reads 'integration'.
   Future<({String state, String skin})> _voiceSatellite({
     required bool configPushed,
   }) async {
+    final s = _settings;
+    if (s.get(defs.voiceRuntime) == 'native') {
+      return s.get(defs.voiceEnabled)
+          ? (state: 'native', skin: s.get(defs.voiceSkin))
+          : (state: 'off', skin: '');
+    }
     Map? page;
     try {
       final r = await commands.execute('vsEngineState', const {});
@@ -597,23 +687,21 @@ class AnalyticsManager extends Manager {
     if (page != null) {
       final config = page['config'];
       if (config is Map) skin = '${config['skin'] ?? ''}';
-      await _settings.setInternal(_vsSeenKey, stamp);
-      final engine = page['engine'];
-      final running = engine is Map && engine['running'] == true;
-      return (state: running ? 'running' : 'stopped', skin: skin);
+      await s.setInternal(_vsSeenKey, stamp);
+      return (state: 'integration', skin: skin);
     }
     if (configPushed) {
-      await _settings.setInternal(_vsSeenKey, stamp);
-      return (state: 'installed', skin: skin);
+      await s.setInternal(_vsSeenKey, stamp);
+      return (state: 'integration', skin: skin);
     }
-    final seen = int.tryParse(_settings.internal(_vsSeenKey));
+    final seen = int.tryParse(s.internal(_vsSeenKey));
     if (seen != null) {
       final at = DateTime.fromMillisecondsSinceEpoch(seen, isUtc: true);
       if (_now().toUtc().difference(at) <= vsMemory) {
-        return (state: 'installed', skin: skin);
+        return (state: 'integration', skin: skin);
       }
     }
-    return (state: 'not_installed', skin: skin);
+    return (state: 'off', skin: skin);
   }
 
   /// The native journal's text, or nothing where there is no journal (a

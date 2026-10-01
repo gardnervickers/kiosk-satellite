@@ -18,7 +18,9 @@ int _sample(Uint8List bytes, int index) =>
 void main() {
   test('candidate is exactly three seconds ending at detector sample', () {
     final history = WakeCandidateBuffer();
-    for (var i = 0; i < 45; i++) history.add(_chunk(i + 1));
+    for (var i = 0; i < 45; i++) {
+      history.add(_chunk(i + 1));
+    }
     const detectionSample = 40 * 1280;
     final candidate = history.at(detectionSample)!;
     expect(candidate.length, 96000);
@@ -38,7 +40,9 @@ void main() {
     expect(_sample(candidate, 46399), 0);
     expect(_sample(candidate, 46400), 123);
     expect(_sample(candidate, 47999), 123);
-    for (var i = 0; i < 60; i++) history.add(_chunk(i));
+    for (var i = 0; i < 60; i++) {
+      history.add(_chunk(i));
+    }
     expect(history.at(1600), isNull);
     history.clear();
     expect(history.at(0), Uint8List(96000));

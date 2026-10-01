@@ -235,6 +235,21 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
   bool _launchOnPlayPending = false;
   Future<void>? _interactionStop;
   bool _cameraViewActive = false;
+
+  /// Native Voice Satellite's overlay is on screen. It draws over the
+  /// screensaver, which stays up underneath: its backlight lifted back to
+  /// the saved level, its rendering paused and its screen-off countdown
+  /// held until the overlay goes (an answer or results can linger after
+  /// the turn itself ends). The integration's engine lives in the
+  /// dashboard, so there a turn still dismisses the screensaver.
+  bool _assistOverlay = false;
+
+  /// The screensaver's animations are paused under the voice overlay.
+  final renderPaused = ValueNotifier<bool>(false);
+
+  bool get _nativeVoice =>
+      _settings.get(defs.voiceRuntime) == 'native' &&
+      _settings.get(defs.voiceEnabled);
   double? _savedBrightness;
 
   /// Whether a notification is on screen. A dimmed screensaver lifts back
@@ -244,9 +259,16 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
 
   /// The visual overlay the UI should render, or null for none.
   ///
-  /// One of 'blank' | 'black' | 'clock' | 'media' | 'website'. Dim only
-  /// lowers the backlight, so this stays null there.
+  /// One of 'blank' | 'black' | 'clock' | 'media' | 'website' | ... Dim
+  /// only lowers the backlight, so this stays null there. 'dashboard' is
+  /// a clear layer over the dashboard itself, there to take the tap that
+  /// dismisses it and to carry the widgets.
   final ValueNotifier<String?> activeView = ValueNotifier(null);
+
+  /// The view the Home Assistant Dashboard mode put on the page this
+  /// session, so the dismissal takes it back and a reapply that changes
+  /// nothing (a notification, a schedule tick) does not navigate again.
+  String? _dashboardShown;
 
   bool get isActive => _active;
 
@@ -351,9 +373,31 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
       // still observe its playback interaction.
       if (e.source == InteractionSource.sendspin && e.reason == 'media') return;
       _paused = _interactions.update(e);
-      if (_paused) _stopForInteraction();
+      // The native satellite's overlay draws over the screensaver.
+      if (_paused && e.source != InteractionSource.native) {
+        _stopForInteraction();
+      }
       _resetIdleTimer();
       if (!_paused) unawaited(_restoreAfterInteraction());
+    });
+    bus.on<AssistOverlayVisibility>().listen((event) {
+      if (event.visible == _assistOverlay) return;
+      _assistOverlay = event.visible;
+      renderPaused.value = event.visible && _active;
+      if (event.visible) {
+        _cancelIdleTimer();
+        if (_active) {
+          _screenOffTimer?.cancel();
+          _screenOffTimer = null;
+          _armedScreenOffMinutes = null;
+          unawaited(_applyVisuals());
+        }
+      } else if (_active) {
+        if (!_screenDark) _armScreenOffTimer();
+        unawaited(_applyVisuals());
+      } else {
+        _resetIdleTimer();
+      }
     });
     bus.on<CameraViewStateChanged>().listen((event) {
       _cameraViewActive = event.active;
@@ -370,7 +414,7 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     // spoken reply, and the screensaver could reappear mid-conversation.
     bus.on<WakeWordDetected>().listen((_) {
       _voiceTurn = true;
-      if (_active) {
+      if (_active && !_nativeVoice) {
         log.debug(name, 'dismissed by wake word');
         _stopForInteraction();
       }
@@ -710,7 +754,8 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
       if (_active &&
           (e.key == defs.screensaverSchedule.key ||
               e.key == defs.screensaverScheduleEnabled.key ||
-              e.key == defs.screensaverMode.key)) {
+              e.key == defs.screensaverMode.key ||
+              e.key == defs.screensaverDashboardView.key)) {
         unawaited(_applyVisuals());
       }
     });
@@ -735,6 +780,33 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     }
 
     commands
+      ..register(
+        Command(
+          name: 'alarmTakeover',
+          description:
+              'An alarm shows on this screensaver: phase sunrise or ringing '
+              'starts it past every idle gate and keeps the panel lit; null '
+              'lets go and leaves the screensaver as it is. Fails when the '
+              'screensaver could not start.',
+          params: const {'phase': 'sunrise, ringing or null'},
+          handler: (p) async {
+            final phase = p['phase'] as String?;
+            if (phase == null) {
+              if (alarmTakeover.value == null) return const CommandResult.ok();
+              alarmTakeover.value = null;
+              if (_active) {
+                _armScreenOffTimer();
+                // Back down to the screensaver's own level.
+                await _applyVisuals();
+              }
+              return const CommandResult.ok();
+            }
+            return await _takeOverForAlarm(phase)
+                ? const CommandResult.ok()
+                : const CommandResult.fail('the screensaver did not start');
+          },
+        ),
+      )
       ..register(
         Command(
           name: 'startScreensaver',
@@ -815,6 +887,28 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
       )
       ..register(
         Command(
+          name: 'holdScreensaver',
+          description:
+              'Keep the screensaver from starting on its idle timer while a '
+              'screen is up, by holder name. Releasing restarts the '
+              'countdown.',
+          params: const {
+            'holder': 'who holds it',
+            'held': 'true to hold, false to let go',
+          },
+          handler: (p) async {
+            final holder = '${p['holder'] ?? ''}';
+            if (holder.isEmpty) {
+              return const CommandResult.fail('holder is required');
+            }
+            p['held'] == true ? _holders.add(holder) : _holders.remove(holder);
+            _resetIdleTimer();
+            return const CommandResult.ok();
+          },
+        ),
+      )
+      ..register(
+        Command(
           name: 'isScreensaverActive',
           description: 'Whether the screensaver is showing right now',
           quiet: true,
@@ -871,6 +965,10 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
   }
 
   void notifyActivity(String source) {
+    // A ringing alarm on this screensaver ends through its Snooze and Stop
+    // buttons only: a brush of the hand, motion or a face never dismisses
+    // it.
+    if (alarmTakeover.value == 'ringing') return;
     // Overlay controls consume their touch without dismissing the view.
     if (_touchOnControl &&
         (source == 'touch' || source == 'touch_page' || source == 'tap')) {
@@ -987,9 +1085,18 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     _resetIdleTimer();
   }
 
+  /// Screens that keep the screensaver away while they are up, by name
+  /// (the alarm list while an alarm is being set). Only the idle clock
+  /// stands still: unlike an interaction hold, music, the wake word and
+  /// the dashboard rotation carry on.
+  final _holders = <String>{};
+
   void _resetIdleTimer() {
     _idleTimer?.cancel();
-    if (_cameraViewActive || _behindAnotherApp) return _setIdleDue(null);
+    if (_holders.isNotEmpty) return _setIdleDue(null);
+    if (_cameraViewActive || _assistOverlay || _behindAnotherApp) {
+      return _setIdleDue(null);
+    }
     if (!_settings.get(defs.screensaverEnabled) || _paused || _voiceTurn) {
       return _setIdleDue(null);
     }
@@ -1211,35 +1318,63 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     unawaited(_applyVisuals());
   }
 
-  Future<void> start() async {
+  /// An alarm showing on this screensaver: `sunrise` while its glow
+  /// window runs, `ringing` while it rings, null otherwise. The Clock and
+  /// Weather Mood faces draw the label and the buttons off it, and while it
+  /// rings nothing but those buttons ends the session.
+  final alarmTakeover = ValueNotifier<String?>(null);
+
+  /// Start (or keep) the session for an alarm, past every gate an idle
+  /// start respects: the alarm decided this screensaver shows it.
+  Future<bool> _takeOverForAlarm(String phase) async {
+    if (!_active) await start(force: true);
+    if (!_active) return false;
+    alarmTakeover.value = phase;
+    _screenOffTimer?.cancel();
+    _screenOffTimer = null;
+    _armedScreenOffMinutes = null;
+    if (_screenDark) {
+      _panelDark = false;
+      _blanked = false;
+      await commands.execute('screenOn', const {});
+    }
+    // A ring lifts the screensaver's own dimming back to normal.
+    await _applyVisuals();
+    return true;
+  }
+
+  Future<void> start({bool force = false}) async {
     if (_active) return;
     // Say why a start goes nowhere: a page hold that never gets released
     // (a leaked "interaction running" from the dashboard) otherwise reads
     // as "Now Playing launched" followed by nothing at all.
-    if (_paused || _voiceTurn || _cameraViewActive) {
+    if (!force &&
+        (_paused || _voiceTurn || _cameraViewActive || _assistOverlay)) {
       final why = <String>[
         if (_paused) 'interaction held (${_interactions.held.join(', ')})',
         if (_voiceTurn) 'voice turn',
         if (_cameraViewActive) 'camera view',
+        if (_assistOverlay) 'voice overlay',
       ];
       log.info(name, 'start refused: ${why.join(', ')}');
       return;
     }
     // Another app owns the screen; a dim now would dim it (the brightness
     // is the device's), and the idle clock is on hold for the same reason.
-    if (_behindAnotherApp) {
+    if (_behindAnotherApp && !force) {
       log.debug(name, 'start refused: another app is in front');
       return;
     }
     // Hold mode refuses every start, commanded ones included: "keep this
     // view on screen" beats a startScreensaver arriving over ESPHome or a
     // gesture (issue #266).
-    if (_settings.get(defs.haHoldMode)) return;
+    if (_settings.get(defs.haHoldMode) && !force) return;
     // No screensaver under Lockdown Mode unless the owner opted in: by
     // default the locked dashboard stays glanceable. Opted in, it renders
     // under the screen-level shield — visible, but untouchable like
     // everything else, and the exit gesture still counts natively.
-    if (_settings.get(defs.lockdownEnabled) &&
+    if (!force &&
+        _settings.get(defs.lockdownEnabled) &&
         !_settings.get(defs.lockdownAllowScreensaver)) {
       return;
     }
@@ -1275,6 +1410,11 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
   void _armScreenOffTimer() {
     _screenOffTimer?.cancel();
     _screenOffTimer = null;
+    // An alarm on this screensaver keeps the panel lit until it lets go.
+    if (alarmTakeover.value != null) {
+      _armedScreenOffMinutes = null;
+      return;
+    }
     final minutes = _effectiveScreenOffMinutes;
     _armedScreenOffMinutes = minutes;
     if (minutes <= 0) return;
@@ -1311,7 +1451,7 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
   /// value, the schedule edited live, or the slider moved. Never under a
   /// dark panel, and never for a reapply that leaves the value alone.
   void _syncScreenOffTimer() {
-    if (!_active || _screenDark) return;
+    if (!_active || _screenDark || _assistOverlay) return;
     if (_effectiveScreenOffMinutes == _armedScreenOffMinutes) return;
     _armScreenOffTimer();
   }
@@ -1401,21 +1541,41 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     scheduleWidgets.value = entry?['widgets'] as bool?;
     scheduleGlance.value = entry?['glance'] as bool?;
     _syncScreenOffTimer();
+    // The voice overlay over the screensaver reads at the saved level,
+    // whatever the mode dims to, and so does an alarm ringing on it: a
+    // screensaver at 0% must not ring in the dark.
+    final lift = _assistOverlay || alarmTakeover.value == 'ringing';
+    final liftForVoice = lift && _savedBrightness != null;
     if (_blanked) {
       await _ensureSavedBrightness();
       if (!_active || !_blanked) return;
       _setView('blank');
-      await commands.execute('setBrightness', {'level': 0, 'ceiling': true});
+      await commands.execute('setBrightness', {
+        'level': lift ? _savedBrightness : 0,
+        'ceiling': true,
+      });
       return;
     }
     // Modes that change brightness save their restore point first.
     if (mode == 'dim' || mode == 'black' || _contentDimEnabled(mode)) {
       await _ensureSavedBrightness();
     }
+    // The Home Assistant Dashboard mode moves the page to its view before
+    // anything decides what covers it: under the Now Playing takeover the
+    // view waits behind the player, and the dismissal undoes the move
+    // either way.
+    final dashboardView = _settings.get(defs.screensaverDashboardView);
+    if (mode == 'dashboard' && dashboardView != _dashboardShown) {
+      _dashboardShown = dashboardView;
+      await commands.execute('showScreensaverDashboard', {
+        'path': dashboardView,
+      });
+      if (!_active) return;
+    }
     if (_nowPlayingNormalBrightness) {
       // A non-null view gives the override a slot to render into ('dim'
-      // normally shows no overlay at all), at full brightness.
-      _setView((mode == 'dim') ? 'black' : mode);
+      // and 'dashboard' show the page itself), at full brightness.
+      _setView((mode == 'dim' || mode == 'dashboard') ? 'black' : mode);
       if (_savedBrightness != null) {
         await commands.execute('setBrightness', {
           'level': _savedBrightness,
@@ -1428,9 +1588,10 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     // schedule entry's: the overlay below is still the mode's own, only the
     // backlight is borrowed back until the last card goes.
     final liftForNotification =
-        _notificationShowing &&
-        _savedBrightness != null &&
-        _settings.get(defs.screensaverNotificationBrightness);
+        liftForVoice ||
+        (_notificationShowing &&
+            _savedBrightness != null &&
+            _settings.get(defs.screensaverNotificationBrightness));
     switch (mode) {
       case 'dim':
         // Backlight only — no overlay. stop() restores the saved level.
@@ -1461,8 +1622,10 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
         // clock / media / website: a lit overlay showing content, at normal
         // brightness unless the separate screensaver brightness — or the
         // active schedule entry — asks for its own level (a clock that must
-        // not glow all night).
-        _setView(mode);
+        // not glow all night). The dashboard gives way to black beside a
+        // shared player, as Dim does: its view is laid out for the whole
+        // screen.
+        _setView(mode == 'dashboard' && nowPlayingShared ? 'black' : mode);
         if (_contentDimEnabled(mode)) {
           final level =
               _scheduleBrightness ??
@@ -1526,6 +1689,8 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     _launchOnPlayPending = false;
     if (!_active) return;
     _active = false;
+    alarmTakeover.value = null;
+    renderPaused.value = false;
     _nowPlayingShared = false;
     _tapChainStart = null;
     _screenOffTimer?.cancel();
@@ -1538,6 +1703,12 @@ class ScreensaverManager extends Manager with WidgetsBindingObserver {
     // never shows a blank hole where the page is (a no-op unless the
     // rendering freeze optimization hid it).
     await commands.execute('unfreezeRendering', const {});
+    // Awaited, so a navigation commanded right after the dismissal (the
+    // ESPHome Dashboard select, haNavigate) lands after this return.
+    if (_dashboardShown != null) {
+      _dashboardShown = null;
+      await commands.execute('leaveScreensaverDashboard', const {});
+    }
     _setView(null);
     await commands.execute('screenOn', const {});
     // Release the hold; the keep-awake setting (if any) still applies.

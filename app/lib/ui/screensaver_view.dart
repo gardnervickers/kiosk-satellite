@@ -6,12 +6,16 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:http/http.dart' as http;
 import 'package:video_player/video_player.dart';
 
+import 'alarms_overlay.dart' show alarmTimeText;
+import '../managers/alarms/alarm_manager.dart';
+import 'alarm_ring_overlay.dart';
 import '../app_container.dart';
 import '../l10n/messages.dart';
 import '../core/events.dart';
@@ -302,6 +306,13 @@ class _ScreensaverOverlayState extends State<ScreensaverOverlay> {
                   // swallows Flutter gestures), so it dismisses itself
                   // rather than sitting under _Dismissable.
                   'camera' => CameraScreensaver(container: container),
+                  // The Home Assistant Dashboard mode: the dashboard itself
+                  // shows through a clear layer that takes the tap, so a
+                  // touch dismisses rather than pressing a card.
+                  'dashboard' => _Dismissable(
+                    container: container,
+                    child: const SizedBox.expand(),
+                  ),
                   // 'black' and anything unexpected: the safe, opaque cover,
                   // carrying the At a Glance row when there is one — unless
                   // the active schedule entry withholds it for its hours,
@@ -426,6 +437,11 @@ class _ScreensaverOverlayState extends State<ScreensaverOverlay> {
                                           nightColor: _widgetNightColor(view),
                                         ),
                                         'entity' => EntityWidgetOverlay(
+                                          container: container,
+                                          spec: spec,
+                                          nightColor: _widgetNightColor(view),
+                                        ),
+                                        'alarm' => AlarmWidgetOverlay(
                                           container: container,
                                           spec: spec,
                                           nightColor: _widgetNightColor(view),
@@ -641,16 +657,31 @@ class _Dismissable extends StatelessWidget {
   );
 }
 
-/// A timeout cover above widgets, timers and notifications.
+/// A timeout cover above widgets, timers and notifications. A voice turn
+/// draws over it: while the voice overlay is up the kiosk places the cover
+/// right under it instead ([underVoice]), so the turn shows on black.
 class ScreensaverBlankOverlay extends StatelessWidget {
-  const ScreensaverBlankOverlay({super.key, required this.container});
+  const ScreensaverBlankOverlay({
+    super.key,
+    required this.container,
+    this.underVoice = false,
+  });
 
   final AppContainer container;
 
+  /// This copy is the one under the voice overlay, shown only during a
+  /// turn; the other is shown only outside one.
+  final bool underVoice;
+
   @override
-  Widget build(BuildContext context) => ValueListenableBuilder<String?>(
-    valueListenable: container.screensaver.activeView,
-    builder: (context, view, _) => view == 'blank'
+  Widget build(BuildContext context) => ListenableBuilder(
+    listenable: Listenable.merge([
+      container.screensaver.activeView,
+      container.screensaver.renderPaused,
+    ]),
+    builder: (context, _) =>
+        container.screensaver.activeView.value == 'blank' &&
+            container.screensaver.renderPaused.value == underVoice
         ? Positioned.fill(
             child: _Dismissable(
               container: container,
@@ -769,6 +800,11 @@ class _ClockScreensaverState extends State<ClockScreensaver>
       if (_liveKeys.contains(e.key)) setState(() {});
     });
     _armBackgroundRefresh();
+    widget.container.screensaver.alarmTakeover.addListener(_onTakeover);
+  }
+
+  void _onTakeover() {
+    if (mounted) setState(() {});
   }
 
   /// Fetch a URL background again every Refresh URL background minutes
@@ -861,6 +897,7 @@ class _ClockScreensaverState extends State<ClockScreensaver>
 
   @override
   void dispose() {
+    widget.container.screensaver.alarmTakeover.removeListener(_onTakeover);
     _tick?.cancel();
     _shift?.cancel();
     _bgSub?.cancel();
@@ -1115,10 +1152,16 @@ class _ClockScreensaverState extends State<ClockScreensaver>
         clockFontWeight(fontValue);
     final opticalSize = clockOpticalSize(fontValue);
     final size = MediaQuery.of(context).size;
+    // A ringing alarm takes the face over: the label on the date line and
+    // Snooze and Stop under it, in the face's own colors. The glance row
+    // steps aside for them.
+    final ringing =
+        widget.container.screensaver.alarmTakeover.value == 'ringing';
     // The At a Glance row sits under the clock and needs room for itself,
     // so the clock gives some back rather than pushing the row off a short
     // panel. Only when the row actually has something to show.
-    final glance = widget.container.glance.entities.value.isNotEmpty;
+    final glance =
+        !ringing && widget.container.glance.entities.value.isNotEmpty;
     final glanceScale = min(1.0, size.height / 480).clamp(0.75, 1.0);
     final clockShrink = glance ? 0.72 : 1.0;
     // min(20vw, 30vh), the same basis Voice Satellite uses, then scaled.
@@ -1126,15 +1169,41 @@ class _ClockScreensaverState extends State<ClockScreensaver>
         min(size.width * 0.20, size.height * 0.30) * scale * clockShrink;
     final dateSize =
         min(size.width * 0.05, size.height * 0.07) * scale * clockShrink;
+    final backdrop =
+        nightBg ??
+        switch (style) {
+          'roller' => _rgb(defs.screensaverRollerBgColor, Colors.black),
+          'flip' => _rgb(defs.screensaverFlipBackdropColor, Colors.black),
+          _ => _rgb(defs.screensaverClockBgColor, Colors.black),
+        };
+    final Widget face = style != 'digital'
+        ? _styledFace(style, scale * clockShrink, font)
+        : DigitalClockFace(
+            time: _time(),
+            date: !ringing && s.get(defs.screensaverClockDate) ? _date() : null,
+            fontFamily: font,
+            color: color,
+            clockSize: clockSize,
+            dateSize: dateSize,
+            weight: timeWeight,
+            opticalSize: opticalSize,
+          );
+    final digitColor =
+        _nightColor() ??
+        switch (style) {
+          'flip' => _rgb(
+            defs.screensaverFlipDigitColor,
+            const Color(0xFFFAFAFA),
+          ),
+          'roller' => _rgb(
+            defs.screensaverRollerDigitColor,
+            const Color(0xFFFAFAFA),
+          ),
+          _ => color,
+        };
 
     return ColoredBox(
-      color:
-          nightBg ??
-          switch (style) {
-            'roller' => _rgb(defs.screensaverRollerBgColor, Colors.black),
-            'flip' => _rgb(defs.screensaverFlipBackdropColor, Colors.black),
-            _ => _rgb(defs.screensaverClockBgColor, Colors.black),
-          },
+      color: backdrop,
       // Expand: both children are pinned to the display, so the stack must
       // be the display rather than sized to whatever the clock happens to
       // measure.
@@ -1185,17 +1254,34 @@ class _ClockScreensaverState extends State<ClockScreensaver>
             alignment: Alignment(0, glance ? _clockAnchorWithGlance : 0),
             child: Transform.translate(
               offset: _offset,
-              child: style != 'digital'
-                  ? _styledFace(style, scale * clockShrink, font)
-                  : DigitalClockFace(
-                      time: _time(),
-                      date: s.get(defs.screensaverClockDate) ? _date() : null,
-                      fontFamily: font,
-                      color: color,
-                      clockSize: clockSize,
-                      dateSize: dateSize,
-                      weight: timeWeight,
-                      opticalSize: opticalSize,
+              child: !ringing
+                  ? face
+                  // The face gives way to the label and the buttons, which
+                  // keep their full size: a flip or roller face fills the
+                  // screen on its own and would otherwise squeeze them.
+                  : Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: face,
+                            ),
+                          ),
+                          SizedBox(height: clockSize * .1),
+                          AlarmTakeoverControls(
+                            container: widget.container,
+                            color: digitColor,
+                            ink: backdrop,
+                            glass: digitColor.withValues(alpha: .1),
+                            edge: digitColor.withValues(alpha: .22),
+                            labelSize: dateSize,
+                            fontFamily: font,
+                          ),
+                        ],
+                      ),
                     ),
             ),
           ),
@@ -1632,6 +1718,144 @@ class _BatteryWidgetOverlayState extends State<BatteryWidgetOverlay> {
       ),
     );
   }
+}
+
+/// The next alarm in a corner: its time within the next 24 hours, or when
+/// a snooze runs out. Empty the rest of the time, so the corner stays
+/// clear. A tap opens the alarm list, the one spot on the screensaver that
+/// does more than dismiss it.
+class AlarmWidgetOverlay extends StatefulWidget {
+  const AlarmWidgetOverlay({
+    super.key,
+    required this.container,
+    required this.spec,
+    this.nightColor,
+  });
+
+  final AppContainer container;
+  final ScreensaverWidget spec;
+  final Color? nightColor;
+
+  @override
+  State<AlarmWidgetOverlay> createState() => _AlarmWidgetOverlayState();
+}
+
+class _AlarmWidgetOverlayState extends State<AlarmWidgetOverlay> {
+  Timer? _shift;
+  Offset _offset = Offset.zero;
+
+  @override
+  void initState() {
+    super.initState();
+    _shift = Timer.periodic(const Duration(minutes: 1), (_) {
+      if (!widget.container.settings.get(defs.screensaverPixelShift)) {
+        // Still rebuild: the 24 hour window moves with the clock.
+        setState(() {});
+        return;
+      }
+      final r = Random();
+      const max = 10.0;
+      setState(() {
+        _offset = Offset(
+          (r.nextDouble() * 2 - 1) * max,
+          (r.nextDouble() * 2 - 1) * max,
+        );
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _shift?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<AlarmStatus>(
+    valueListenable: widget.container.alarms.status,
+    builder: (context, status, _) {
+      final now = DateTime.now();
+      final snoozed = status.phase == AlarmPhase.snoozed
+          ? status.snoozedUntil
+          : null;
+      final next = status.next?.at;
+      final String text;
+      final IconData icon;
+      if (snoozed != null) {
+        text = l10n(
+          context,
+        ).alarmsSnoozedUntil(alarmTimeText(context, snoozed));
+        icon = Icons.snooze;
+      } else if (next != null &&
+          next.difference(now) <= const Duration(hours: 24)) {
+        text = alarmTimeText(context, next);
+        icon = Icons.alarm;
+      } else {
+        return const SizedBox.shrink();
+      }
+      final corner = _cornerAlignment(widget.spec.position);
+      final color =
+          widget.nightColor ?? _widgetRgb(widget.spec.config['color']);
+      final size = MediaQuery.of(context).size;
+      final scale = _widgetScale(widget.container, widget.spec);
+      final textSize = max(min(size.width, size.height) * 0.042, 30.0) * scale;
+      final font = _widgetFont(widget.container, widget.spec);
+      final shadows = _overlayTextShadows(widget.container);
+      final glyph = Icon(
+        icon,
+        size: textSize * 1.1,
+        color: color,
+        shadows: shadows,
+      );
+      final label = Text(
+        text,
+        style: TextStyle(
+          fontFamily: font.family,
+          color: color,
+          fontSize: textSize,
+          fontWeight: font.weight ?? FontWeight.w400,
+          fontVariations: clockFontVariations(
+            font.opticalSize,
+            font.weight ?? FontWeight.w400,
+          ),
+          height: 1.0,
+          shadows: shadows,
+        ),
+      );
+      final right = corner.x > 0;
+      final gap = SizedBox(width: 10 * scale);
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          IgnorePointer(
+            child: _cornerVignette(corner, widget.container, radius: 0.5),
+          ),
+          Align(
+            alignment: corner,
+            child: Padding(
+              padding: const EdgeInsets.all(28),
+              child: Transform.translate(
+                offset: _offset,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () =>
+                      widget.container.commands.execute('openAlarms', const {}),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (right) ...[label, gap],
+                      glyph,
+                      if (!right) ...[gap, label],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
 }
 
 /// At or below this the charge counts as low: the "only when low" widget
@@ -2407,7 +2631,8 @@ class _ScreensaverWebViewState extends State<ScreensaverWebView> {
     try {
       await _webView?.evaluateJavascript(
         source:
-            'window.__ksPhotoActive && window.__ksPhotoActive($_photoScreenOn)',
+            'window.__ksPhotoActive && '
+            'window.__ksPhotoActive(${_photoScreenOn && !_renderPaused})',
       );
     } catch (_) {
       // A navigating renderer receives the state again after its load.
@@ -2472,9 +2697,22 @@ class _ScreensaverWebViewState extends State<ScreensaverWebView> {
   /// the whole session; a paced reload brings the site back on its own.
   Timer? _retry;
 
+  bool get _renderPaused => widget.container.screensaver.renderPaused.value;
+
+  /// Under the native voice overlay, which shows a still of the
+  /// screensaver: the page is paused (its own onPause, which stops its
+  /// scripts' rendering, animations and video) and the Media deck holds.
+  void _renderPausedChanged() {
+    unawaited(_setPhotoActivity());
+    final controller = _webView;
+    if (controller == null) return;
+    unawaited(_renderPaused ? controller.pause() : controller.resume());
+  }
+
   @override
   void initState() {
     super.initState();
+    widget.container.screensaver.renderPaused.addListener(_renderPausedChanged);
     if (widget.mode == 'media') {
       _photoScreenSub = widget.container.bus.on<ScreenStateChanged>().listen((
         e,
@@ -2512,6 +2750,9 @@ class _ScreensaverWebViewState extends State<ScreensaverWebView> {
 
   @override
   void dispose() {
+    widget.container.screensaver.renderPaused.removeListener(
+      _renderPausedChanged,
+    );
     widget.container.screensaver.detachSlides(_step);
     _retry?.cancel();
     _kioskSub?.cancel();
@@ -2734,6 +2975,7 @@ setInterval(function () {
       },
       onWebViewCreated: (controller) {
         _webView = controller;
+        if (_renderPaused) unawaited(controller.pause());
         controller.addJavaScriptHandler(
           handlerName: 'dismiss',
           callback: (_) {
@@ -2769,10 +3011,20 @@ setInterval(function () {
 /// The descriptor already accounts for EXIF orientation.
 Future<double?> _aspectOf(Uint8List bytes) => photoAspect(bytes);
 
+/// Whether [video] has frames to show. A video slide clears the photo, and
+/// a decoder error resets the controller to uninitialized, so an errored
+/// video with no photo behind it is an empty slide until the next one.
+bool _videoShowing(VideoPlayerController? video) =>
+    video != null && video.value.isInitialized;
+
 /// Screen-off preserves the slide and its remaining hold. In-flight reads
-/// finish, but decoding and committing a new slide wait for the panel.
+/// finish, but decoding and committing a new slide wait for the panel. The
+/// native voice overlay holds it the same way: it shows a still of the
+/// screensaver, so nothing under it advances or decodes.
 mixin _PhotoScreenState<T extends StatefulWidget> on State<T> {
   bool _awake = true;
+  bool _screenOn = true;
+  ValueListenable<bool>? _photoRenderPaused;
   StreamSubscription<ScreenStateChanged>? _photoScreenSub;
   Completer<void>? _wake;
   StreamSubscription<SettingChanged>? _photoSettingsSub;
@@ -2810,16 +3062,27 @@ mixin _PhotoScreenState<T extends StatefulWidget> on State<T> {
   final _photoRetireTimers = <Timer>[];
 
   void _watchPhotoScreen(AppContainer c) {
-    _awake = c.screen.isScreenOn;
+    _screenOn = c.screen.isScreenOn;
+    _photoRenderPaused = c.screensaver.renderPaused
+      ..addListener(_photoAwakeChanged);
+    _awake = _photoAwake;
     _photoScreenSub = c.bus.on<ScreenStateChanged>().listen((e) {
-      if (!mounted || _awake == e.on) return;
-      setState(() => _awake = e.on);
-      if (e.on) {
-        _wake?.complete();
-        _wake = null;
-      }
-      _photoScreenChanged(e.on);
+      _screenOn = e.on;
+      _photoAwakeChanged();
     });
+  }
+
+  bool get _photoAwake => _screenOn && !(_photoRenderPaused?.value ?? false);
+
+  void _photoAwakeChanged() {
+    final awake = _photoAwake;
+    if (!mounted || _awake == awake) return;
+    setState(() => _awake = awake);
+    if (awake) {
+      _wake?.complete();
+      _wake = null;
+    }
+    _photoScreenChanged(awake);
   }
 
   Future<void> _waitForPhotoScreen() async {
@@ -2827,6 +3090,20 @@ mixin _PhotoScreenState<T extends StatefulWidget> on State<T> {
   }
 
   void _photoScreenChanged(bool awake);
+
+  /// Holds the video on screen with the slideshow, and plays it on after.
+  void _holdVideo(VideoPlayerController? video, bool awake) {
+    if (video == null || !video.value.isInitialized) return;
+    if (!awake) {
+      unawaited(video.pause());
+      return;
+    }
+    final value = video.value;
+    if (value.duration > Duration.zero && value.position >= value.duration) {
+      return;
+    }
+    unawaited(video.play());
+  }
 
   void _retirePhoto(PreparedPhoto? photo) {
     if (photo == null) return;
@@ -2843,6 +3120,7 @@ mixin _PhotoScreenState<T extends StatefulWidget> on State<T> {
   @override
   void dispose() {
     _photoScreenSub?.cancel();
+    _photoRenderPaused?.removeListener(_photoAwakeChanged);
     _photoSettingsSub?.cancel();
     _wake?.complete();
     for (final timer in _photoRetireTimers) {
@@ -3065,6 +3343,17 @@ class _LocalMediaScreensaverState extends State<LocalMediaScreensaver>
             // no longer the slideshow's cue.
             ended = true;
             if (identical(_video, video)) _advance();
+          } else if (!ended && v.hasError) {
+            // A decoder that dies mid-playback resets the controller to
+            // uninitialized and never reaches the end, so the error is the
+            // cue instead.
+            ended = true;
+            if (!identical(_video, video)) return;
+            c.log.warn(
+              'screensaver',
+              'video stopped playing (${file.path}): ${v.errorDescription}',
+            );
+            _advance();
           }
         });
         if (!mounted) {
@@ -3206,6 +3495,7 @@ class _LocalMediaScreensaverState extends State<LocalMediaScreensaver>
 
   @override
   void _photoScreenChanged(bool awake) {
+    _holdVideo(_video, awake);
     if (awake) {
       _timer?.resume();
       if (_image != null && _stepping == null) _prefetch(_index + 1);
@@ -3280,7 +3570,7 @@ class _LocalMediaScreensaverState extends State<LocalMediaScreensaver>
           style: const TextStyle(color: Colors.white54, fontSize: 16),
         ),
       );
-    } else if (_files.isEmpty || (_image == null && video == null)) {
+    } else if (_files.isEmpty || (_image == null && !_videoShowing(video))) {
       body = const SizedBox.expand();
     } else {
       final transition = _transition;
@@ -3733,6 +4023,18 @@ class _ImmichScreensaverState extends State<ImmichScreensaver>
             // no longer the slideshow's cue.
             ended = true;
             if (identical(_video, video)) _advance();
+          } else if (!ended && v.hasError) {
+            // A decoder that dies mid-playback resets the controller to
+            // uninitialized and never reaches the end, so the error is the
+            // cue instead.
+            ended = true;
+            if (!identical(_video, video)) return;
+            c.log.warn(
+              'screensaver',
+              'immich video stopped playing (${asset.id}): '
+                  '${v.errorDescription}',
+            );
+            _advance();
           }
         });
         if (!mounted) {
@@ -3981,6 +4283,7 @@ class _ImmichScreensaverState extends State<ImmichScreensaver>
 
   @override
   void _photoScreenChanged(bool awake) {
+    _holdVideo(_video, awake);
     if (awake) {
       _timer?.resume();
       _retry?.resume();
@@ -4147,7 +4450,7 @@ class _ImmichScreensaverState extends State<ImmichScreensaver>
           style: const TextStyle(color: Colors.white54, fontSize: 16),
         ),
       );
-    } else if (_image == null && video == null) {
+    } else if (_image == null && !_videoShowing(video)) {
       body = const SizedBox.expand();
     } else {
       final transition = _transition;
@@ -4696,6 +4999,7 @@ class _CameraScreensaverState extends State<CameraScreensaver>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    c.screensaver.renderPaused.addListener(_syncPaused);
     // The next and previous slide buttons step the rotation like a
     // slideshow, through the same hand-off as the timer.
     c.screensaver.attachSlides(_step);
@@ -4804,9 +5108,18 @@ class _CameraScreensaverState extends State<CameraScreensaver>
   /// the screen is never left black.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final paused =
+    _background =
         state != AppLifecycleState.resumed &&
         state != AppLifecycleState.inactive;
+    _syncPaused();
+  }
+
+  bool _background = false;
+
+  /// Behind another app, or under the native voice overlay (which shows a
+  /// still of the grid): the rotation holds.
+  void _syncPaused() {
+    final paused = _background || c.screensaver.renderPaused.value;
     if (paused == _paused) return;
     _paused = paused;
     if (paused) {
@@ -4819,6 +5132,7 @@ class _CameraScreensaverState extends State<CameraScreensaver>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    c.screensaver.renderPaused.removeListener(_syncPaused);
     c.screensaver.detachSlides(_step);
     _settingsSub?.cancel();
     _dwell?.cancel();
@@ -4846,6 +5160,7 @@ class _CameraScreensaverState extends State<CameraScreensaver>
               interactive: false,
               onDismiss: () => c.screensaver.notifyActivity('touch'),
               onPlaying: _onPlaying,
+              paused: c.screensaver.renderPaused,
             ),
     ),
   );

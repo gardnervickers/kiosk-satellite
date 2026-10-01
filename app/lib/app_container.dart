@@ -25,6 +25,7 @@ import 'managers/notifications/notification_manager.dart';
 import 'managers/fleet/fleet_manager.dart';
 import 'managers/fleet/fleet_sync_manager.dart';
 import 'managers/intercom/intercom_manager.dart';
+import 'managers/alarms/alarm_manager.dart';
 import 'managers/analytics/analytics_manager.dart';
 import 'managers/location/location_manager.dart';
 import 'managers/person/person_sensor_manager.dart';
@@ -40,6 +41,7 @@ import 'managers/sound/sound_manager.dart';
 import 'managers/settings/provisioning.dart';
 import 'managers/settings/settings_manager.dart';
 import 'managers/update/update_manager.dart';
+import 'managers/voice/voice_manager.dart';
 import 'managers/voice_timers/voice_timer_manager.dart';
 import 'managers/wake_word/wake_word_manager.dart';
 
@@ -107,6 +109,7 @@ class AppContainer {
     files = FilesManager(bus, commands, log);
     sound = SoundManager(bus, commands, log, settings: settings);
     voiceTimers = VoiceTimerManager(bus, commands, log);
+    voice = VoiceManager(bus, commands, log, settings, btProxy, wakeWord);
     notifications = NotificationManager(bus, commands, log, settings);
     update = UpdateManager(
       bus,
@@ -126,6 +129,7 @@ class AppContainer {
     fleet = FleetManager(bus, commands, log, settings);
     fleetSync = FleetSyncManager(bus, commands, log, settings);
     intercom = IntercomManager(bus, commands, log, settings);
+    alarms = AlarmManager(bus, commands, log, settings);
   }
 
   final bus = EventBus();
@@ -164,6 +168,7 @@ class AppContainer {
   late final GlanceManager glance;
   late final SoundManager sound;
   late final VoiceTimerManager voiceTimers;
+  late final VoiceManager voice;
   late final NotificationManager notifications;
   late final UpdateManager update;
   late final ShizukuManager shizuku;
@@ -172,6 +177,7 @@ class AppContainer {
   late final FleetManager fleet;
   late final FleetSyncManager fleetSync;
   late final IntercomManager intercom;
+  late final AlarmManager alarms;
 
   /// Built after [device.init] so it can carry the app version.
   late final JsApiManager jsApi;
@@ -218,6 +224,10 @@ class AppContainer {
     glance,
     sound,
     voiceTimers,
+    // After the ESPHome server (its voice link), the wake word engine it
+    // configures, and the sound and timer managers it plays and shows
+    // through.
+    voice,
     notifications,
     update,
     shizuku,
@@ -230,6 +240,9 @@ class AppContainer {
     // After fleet too: the roster is the switcher's list. After sound: it
     // chimes through it.
     intercom,
+    // Last: its first check can ring at once, and a ring reaches for the
+    // screen, the screensaver, the kiosk and the wake word's stop word.
+    alarms,
   ];
 
   Future<void> init() async {

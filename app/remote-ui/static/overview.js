@@ -1,5 +1,5 @@
 import { overviewLabel, overviewMessageBox as messageBox, overviewModalShell as modalShell } from './overview_labels.js';
-import { overviewText, overviewStatus, cameraError, deviceText, deviceOperationError, intercomText, mediaText, mediaError, navigationText, t } from './localization.js';
+import { overviewText, overviewStatus, cameraError, deviceText, deviceOperationError, intercomText, mediaText, mediaError, navigationText, t, voiceText } from './localization.js';
 import { watchUpdates } from './live.js';
 import { $, api, cmd, state } from './core.js';
 import { attachUpdateInstall, refreshUpdateBadge } from './device.js';
@@ -10,6 +10,8 @@ import { permissionSpecs } from './permissions.js';
 import { loadPlugins } from './plugins.js';
 import { showTab } from './tabs.js';
 import { attachSlider, showToast } from './widgets.js';
+import { openVsMigrationWizard } from './vs_native.js';
+import { ALARM_ICON, alarmClockText } from './alarms.js';
 
 /* ---- Overview ----
    The first page, and for most visits the only one: what the kiosk needs
@@ -339,12 +341,17 @@ function openButton(btn, label, tab) {
    results) that one source, and the tiles and the attention list are
    painted whole from the cache. A settings change repaints from the
    cache without a single command. */
-const health = { ha: null, wake: null, esp: null, media: null, svc: null,
+const health = { ha: null, wake: null, voice: null, esp: null, media: null, svc: null,
   upd: null, perms: null, guard: null, fleet: null, tiles: null };
 const SOURCES = {
   ha: { topics: ['ha'], read: async () => { health.ha = await ask('haStatus'); } },
   // Wake word pushes arrive as their own message (ks-wakeword below).
   wake: { topics: [], read: async () => { health.wake = await ask('getWakeWordState'); } },
+  // The native satellite: added to Home Assistant, listening or mid-turn.
+  // The same source and topic as the Voice Satellite page's Status row.
+  voice: { topics: ['voice-status'], read: async () => {
+    health.voice = settingVal('voice.runtime') === 'dashboard' ? null : await ask('voiceStatus');
+  } },
   // Sampled on the device, pushed only when something other than the
   // beacon counters moved, with the sample attached.
   esp: { topics: ['bluetooth'], read: async (results) => {
@@ -422,11 +429,28 @@ async function paintHaStatus(ha, { filter = true } = {}) {
     enabled ? overviewStatus(current?.label || 'Filter status unavailable') : overviewText('Validated'));
 }
 
+/* The native satellite, worded as the Voice Satellite page's Status row.
+   A wake word engine that failed on its own (a lost microphone, missing
+   models) still says why; muting and turning Voice Satellite off release
+   it on purpose and read as themselves. */
+function paintNativeVoice(wake, voice) {
+  const words = (wake?.models || []).map((m) => m.wakeWord).filter(Boolean).join(', ');
+  if (!settingOn('voice.enabled')) paintTile('voice', '', overviewText('Off'));
+  else if (!settingOn('esphome.enabled') || voice?.subscribed !== true) paintTile('voice', 'warn', voiceText('Not added'));
+  else if (settingOn('voice.mute')) paintTile('voice', '', voiceText('Muted'));
+  else if (wake?.released && !['muted', 'native-off'].includes(wake.releaseReason)) {
+    paintTile('voice', 'warn', overviewStatus(wake.statusLabel || 'Not listening'));
+  } else if (voice?.busy) paintTile('voice', 'on', voiceText('Busy'));
+  else if (!voice?.listening) paintTile('voice', 'warn', overviewStatus(wake?.statusLabel || 'Not listening'));
+  else paintTile('voice', 'on', words ? t('overviewListeningFor', {words}) : overviewText('Listening'));
+}
+
 function paintHealth({ filter = true } = {}) {
   const { ha, wake, esp, media, svc, upd, perms, guard, fleet, tiles } = health;
   void paintHaStatus(ha, { filter });
 
-  if (!settingOn('wake_word.enabled')) paintTile('voice', '', overviewText('Wake word detection off'));
+  if (settingVal('voice.runtime') !== 'dashboard') paintNativeVoice(wake, health.voice);
+  else if (!settingOn('wake_word.enabled')) paintTile('voice', '', overviewText('Wake word detection off'));
   else if (!wake) paintTile('voice', '', overviewText('Status unavailable'));
   else if (wake.released) paintTile('voice', 'warn', overviewStatus(wake.releaseReason || 'Stopped'));
   else if (wake.listening) {
@@ -548,6 +572,19 @@ function paintHealth({ filter = true } = {}) {
       },
     });
   }
+  // Still on the Voice Satellite integration's engine: the Voice Satellite
+  // page's notice, with the same way out.
+  if (settingVal('voice.runtime') === 'dashboard' && ha?.connected) {
+    items.push({
+      key: 'vs-migrate',
+      name: 'Voice Satellite',
+      desc: voiceText('Voice Satellite is currently installed as an integration in Home Assistant. Migrate to a native experience inside Kiosk Satellite.'),
+      action: (btn) => {
+        btn.textContent = voiceText('Migrate');
+        btn.onclick = () => openVsMigrationWizard();
+      },
+    });
+  }
   if (svc?.error) {
     items.push({
       key: 'service',
@@ -562,7 +599,7 @@ function paintHealth({ filter = true } = {}) {
     const all = { ...perms };
     if (guard !== null) all.uiGuard = guard === true;
     const text = (t) => (typeof t === 'function' ? t(all) : t);
-    for (const spec of permissionSpecs(settingOn)) {
+    for (const spec of permissionSpecs(settingOn, settingVal)) {
       if (!spec.needed || all[spec.key] !== false) continue;
       // No settings screen for it on this device: the adb line on the
       // Device page is the answer, not a button that opens nothing.
@@ -582,7 +619,7 @@ function paintHealth({ filter = true } = {}) {
 // it may have lost shows up through the service sample, which the device
 // pushes on its own.
 async function refreshWake() {
-  await readSource('wake');
+  await Promise.all([readSource('wake'), readSource('voice')]);
   paintHealth({ filter: false });
 }
 
@@ -840,6 +877,65 @@ document.addEventListener('ks-event', (e) => {
   if (e.detail.data && typeof e.detail.data === 'object') paintDndTile(e.detail.data);
 });
 
+/* ---- Alarm banner ----
+   While an alarm rings, is snoozed or runs its sunrise, a banner over
+   everything else on the page with Snooze (while ringing) and Stop.
+   Painted from the alarmsStatus command on a visit and from the alarms
+   event the device pushes, which carries the same status. */
+let alarmState = null;
+function paintAlarmBanner(s) {
+  alarmState = s;
+  const el = $('#alarmBanner');
+  if (!el) return;
+  const phase = s?.phase;
+  const title = { ringing: t('alarmsRinging'), snoozed: t('alarmsSnoozed'),
+    sunrise: t('alarmsSunriseRunning') }[phase];
+  el.classList.toggle('hidden', !title);
+  if (!title) { el.replaceChildren(); return; }
+  const labels = (s.labels || []).filter(Boolean);
+  const line = (phase === 'snoozed' && s.snoozedUntil
+    ? [t('alarmsSnoozedUntil', { time: alarmClockText(s.snoozedUntil) }), ...labels]
+    : [s.at ? alarmClockText(s.at) : '', ...labels]).filter(Boolean).join(' \u00b7 ');
+  const icon = document.createElement('span');
+  icon.className = 'alarm-banner-icon';
+  icon.innerHTML = ALARM_ICON;
+  const text = document.createElement('div');
+  text.className = 'alarm-banner-text';
+  const head = document.createElement('b');
+  head.textContent = title;
+  const sub = document.createElement('span');
+  sub.textContent = line;
+  text.append(head, sub);
+  const actions = document.createElement('div');
+  actions.className = 'alarm-banner-actions';
+  const act = (label, cls, name) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = cls;
+    b.textContent = label;
+    b.addEventListener('click', async () => {
+      b.disabled = true;
+      const res = await cmd(name).catch(() => null);
+      if (!res || res.ok === false) {
+        showToast({ title: label, message: (res && res.error) || overviewText('The device did not answer.'), kind: 'error' });
+        b.disabled = false;
+      }
+      paintAlarmBanner(await ask('alarmsStatus'));
+    });
+    return b;
+  };
+  if (phase === 'ringing') actions.appendChild(act(t('alarmsSnooze'), 'btn-ghost', 'alarmSnooze'));
+  actions.appendChild(act(t('alarmsStop'), 'btn-primary', 'alarmStop'));
+  el.replaceChildren(icon, text, actions);
+}
+async function refreshAlarmBanner() {
+  paintAlarmBanner(await ask('alarmsStatus'));
+}
+document.addEventListener('ks-event', (e) => {
+  if (e.detail?.event !== 'alarms') return;
+  if (e.detail.data && typeof e.detail.data === 'object') paintAlarmBanner(e.detail.data);
+});
+
 function paintSnapshotTile() {
   const tile = $('#tileSnapshot');
   tile.classList.toggle('hidden', !settingOn('camera.enabled') || state.cameraPresent === false);
@@ -912,6 +1008,7 @@ export function overviewShown() {
   paintSnapshotTile();
   paintRestartDeviceTile();
   refreshDndTile();
+  refreshAlarmBanner();
   paintTaken();
   if (live && (!state.screenshotAt || Date.now() - state.screenshotAt > TICK_MS)) loadScreenshot();
 }
@@ -925,11 +1022,13 @@ export async function initOverview() {
   paintShotMode();
   paintShotBadge();
   paintSnapshotTile();
-  await Promise.all([refreshHealth(), refreshVolume(), paintRestartDeviceTile(), refreshDndTile(), readMetricHistory()]);
+  await Promise.all([refreshHealth(), refreshVolume(), paintRestartDeviceTile(), refreshDndTile(), refreshAlarmBanner(), readMetricHistory()]);
 }
 
 document.addEventListener('ks-settings-cached', () => {
   paintHealth({filter: false});
+  // A language change: the banner's words, from the status already held.
+  paintAlarmBanner(alarmState);
   paintShotMode();
   renderQuickControls();
 });

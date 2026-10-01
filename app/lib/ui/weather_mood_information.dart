@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 
+import 'alarm_ring_overlay.dart';
 import '../app_container.dart';
 import '../core/locale_dates.dart';
 import '../l10n/messages.dart';
@@ -13,6 +14,7 @@ import 'clock_faces.dart';
 import 'digital_clock_face.dart';
 import 'glance_row.dart';
 import 'glass_chip.dart';
+import 'text_snapshot.dart';
 import 'weather_readings.dart';
 
 /// A soft shadow for text over the open sky, sized to the text: a faint
@@ -157,7 +159,15 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
   void initState() {
     super.initState();
     _schedule();
+    widget.container.screensaver.alarmTakeover.addListener(_onTakeover);
   }
+
+  void _onTakeover() {
+    if (mounted) setState(() {});
+  }
+
+  bool get _ringing =>
+      widget.container.screensaver.alarmTakeover.value == 'ringing';
 
   @override
   void didUpdateWidget(WeatherMoodInformation oldWidget) {
@@ -205,13 +215,43 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
 
   @override
   void dispose() {
+    widget.container.screensaver.alarmTakeover.removeListener(_onTakeover);
     _timer?.cancel();
     super.dispose();
   }
 
+  /// Snooze and Stop in the weather chips' glass and text shadow, the
+  /// label on the date line: a ringing alarm taking the scene over.
+  Widget _alarmControls(double dateSize, Color color, String? fontFamily) {
+    final s = widget.container.settings;
+    final glass = weatherMoodGlass(widget.container);
+    final shadow = s.get(defs.screensaverWeatherBarShadow);
+    return AlarmTakeoverControls(
+      container: widget.container,
+      color: color,
+      ink: const Color(0xFF1C1C1E),
+      glass: glass.fill,
+      edge: Colors.white.withValues(alpha: math.max(.18, glass.edge.a)),
+      labelSize: dateSize,
+      labelColor: color,
+      labelWeight: FontWeight.w500,
+      fontFamily: fontFamily,
+      shadows: shadow ? _chipShadows(1) : const [],
+    );
+  }
+
   Widget _clock(Size size, bool glance) {
     final s = widget.container.settings;
-    if (!s.get(defs.screensaverWeatherClock)) return const SizedBox.expand();
+    if (!s.get(defs.screensaverWeatherClock)) {
+      if (!_ringing) return const SizedBox.expand();
+      return Center(
+        child: _alarmControls(
+          math.min(size.width * .05, size.height * .07),
+          _color(s.get(defs.screensaverWeatherClockColor)),
+          null,
+        ),
+      );
+    }
     final use24h = s.get(defs.screensaverWeatherClock24h);
     final hour = use24h
         ? _now.hour
@@ -233,6 +273,32 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
     final clockSize = math.min(size.width * .20, size.height * .30) * scale;
     final dateSize = math.min(size.width * .05, size.height * .07) * scale;
     final shadow = s.get(defs.screensaverWeatherClockShadow);
+    final ringing = _ringing;
+    final date = !ringing && s.get(defs.screensaverWeatherClockDate)
+        ? fullDate(_now)
+        : null;
+    final color = _color(s.get(defs.screensaverWeatherClockColor));
+    final weight =
+        clockWeightOverride(s.get(defs.screensaverWeatherClockFontWeight)) ??
+        clockFontWeight(font);
+    final face = DigitalClockFace(
+      time: time,
+      dateGapFactor: .015,
+      dateOpacity: 1,
+      date: date,
+      color: color,
+      clockSize: clockSize,
+      dateSize: dateSize,
+      fontFamily: clockFontFamily(font),
+      weight: weight,
+      opticalSize: clockOpticalSize(font),
+      // Each line's shadow is sized to its own text.
+      shadows: shadow ? _skyShadows(clockSize) : const [],
+      dateShadows: shadow ? _dateShadows(dateSize) : const [],
+      // A step heavier than the Clock screensaver's, so the thin
+      // strokes hold up over white clouds.
+      dateWeight: FontWeight.w500,
+    );
     return Padding(
       padding: const EdgeInsets.all(28),
       child: Center(
@@ -240,30 +306,33 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
           offset: _offset,
           child: FittedBox(
             fit: BoxFit.scaleDown,
-            child: DigitalClockFace(
-              time: time,
-              dateGapFactor: .015,
-              dateOpacity: 1,
-              date: s.get(defs.screensaverWeatherClockDate)
-                  ? fullDate(_now)
-                  : null,
-              color: _color(s.get(defs.screensaverWeatherClockColor)),
-              clockSize: clockSize,
-              dateSize: dateSize,
-              fontFamily: clockFontFamily(font),
-              weight:
-                  clockWeightOverride(
-                    s.get(defs.screensaverWeatherClockFontWeight),
-                  ) ??
-                  clockFontWeight(font),
-              opticalSize: clockOpticalSize(font),
-              // Each line's shadow is sized to its own text.
-              shadows: shadow ? _skyShadows(clockSize) : const [],
-              dateShadows: shadow ? _dateShadows(dateSize) : const [],
-              // A step heavier than the Clock screensaver's, so the thin
-              // strokes hold up over white clouds.
-              dateWeight: FontWeight.w500,
-            ),
+            // Blurred shadows redraw every frame on Impeller unless the
+            // face is kept as an image until the time changes.
+            child: ringing
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      face,
+                      SizedBox(height: clockSize * .08),
+                      _alarmControls(dateSize, color, clockFontFamily(font)),
+                    ],
+                  )
+                : shadow
+                ? TextSnapshot(
+                    // The soft shadows reach this far past the text.
+                    bleed: math.max(clockSize * .16, dateSize * .8),
+                    content: (
+                      time,
+                      date,
+                      color,
+                      clockSize,
+                      dateSize,
+                      font,
+                      weight,
+                    ),
+                    child: face,
+                  )
+                : face,
           ),
         ),
       ),
@@ -274,7 +343,10 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
   Widget build(BuildContext context) {
     final c = widget.container;
     final size = MediaQuery.sizeOf(context);
+    final ringing = _ringing;
     return IgnorePointer(
+      // A ringing alarm's Snooze and Stop are the one thing here to touch.
+      ignoring: !ringing,
       child: RepaintBoundary(
         child: ValueListenableBuilder<bool?>(
           valueListenable: c.screensaver.scheduleGlance,
@@ -282,6 +354,7 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
             valueListenable: c.glance.entities,
             builder: (context, entities, _) {
               final glance =
+                  !ringing &&
                   (scheduled ??
                       c.settings.get(defs.screensaverGlanceEnabled)) &&
                   entities.isNotEmpty;
@@ -292,7 +365,8 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
                     Padding(
                       padding: EdgeInsets.only(
                         bottom:
-                            c.settings.get(defs.screensaverWeatherBar) &&
+                            !ringing &&
+                                c.settings.get(defs.screensaverWeatherBar) &&
                                 widget.readings.available
                             ? 24
                             : size.height * .06,
@@ -313,7 +387,8 @@ class _WeatherMoodInformationState extends State<WeatherMoodInformation> {
                             : const [],
                       ),
                     ),
-                  if (c.settings.get(defs.screensaverWeatherBar) &&
+                  if (!ringing &&
+                      c.settings.get(defs.screensaverWeatherBar) &&
                       widget.readings.available)
                     WeatherMoodBar(
                       container: c,
@@ -372,15 +447,26 @@ class WeatherMoodBar extends StatelessWidget {
     );
     // A StadiumBorder keeps the radius at half the chip's own height; an
     // oversized corner radius once froze Impeller's raster thread.
-    Widget chip(Widget child, EdgeInsets padding) => GlassChip(
-      palette: glass,
-      fallback: Container(
-        padding: padding * scale,
-        decoration: glass.decoration,
-        child: child,
-      ),
-      child: Padding(padding: padding * scale, child: child),
-    );
+    // [content] is everything the chip shows, so the snapshot that keeps
+    // its shadowed text from redrawing every frame refreshes when it does.
+    Widget chip(Widget child, EdgeInsets padding, Object content) {
+      final body = shadows.isEmpty
+          ? child
+          : TextSnapshot(
+              content: (content, scale, color),
+              bleed: 20 * scale,
+              child: child,
+            );
+      return GlassChip(
+        palette: glass,
+        fallback: Container(
+          padding: padding * scale,
+          decoration: glass.decoration,
+          child: body,
+        ),
+        child: Padding(padding: padding * scale, child: body),
+      );
+    }
 
     Widget disc(double diameter, Widget icon) => Container(
       width: diameter * scale,
@@ -431,6 +517,7 @@ class WeatherMoodBar extends StatelessWidget {
         ],
       ),
       const EdgeInsets.fromLTRB(6, 6, 18, 6),
+      (screensaverText(context, title), value, icon, titles),
     );
     final metrics = <Widget>[
       if (s.get(defs.screensaverWeatherBarHumidity) &&
@@ -522,6 +609,7 @@ class WeatherMoodBar extends StatelessWidget {
         ],
       ),
       const EdgeInsets.fromLTRB(6, 6, 18, 6),
+      (temperature, condition, location, forecast, readings.condition),
     );
     final gap = 12 * scale;
     // One row when the chips' real widths fit: conditions at the left and

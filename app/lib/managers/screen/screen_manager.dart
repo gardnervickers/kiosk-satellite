@@ -88,6 +88,25 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
   /// [_applyWakelock]).
   bool _screensaverHold = false;
 
+  /// The intercom's roster or call screen is up. A call takes over from the
+  /// screensaver, which lets go of the screen as it stands down, so without
+  /// this the OS timeout runs through the call (discussion #729: a Portal fell
+  /// into Meta's home screen dream during a call nobody touched).
+  bool _intercomHold = false;
+
+  /// A sunrise or a ringing alarm holds the screen on the same way.
+  bool _alarmHold = false;
+
+  /// The panel level from before a sunrise took it, for when no other
+  /// write came in meanwhile.
+  double? _lastWrittenBeforeAlarm;
+
+  /// The level an alarm's sunrise has put on the panel, or null. While
+  /// set, every other write is remembered in [_heldLevel] instead of
+  /// landing, and that level comes back when the alarm lets go.
+  double? _alarmLevel;
+  double? _heldLevel;
+
   @override
   Future<void> init() async {
     await _applyWakelock();
@@ -188,6 +207,15 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
     await _probeLightSensor();
     bus.on<LightLevelChanged>().listen((e) => _onLux(e.lux));
     bus.on<ScreensaverStateChanged>().listen((e) => _onScreensaver(e.active));
+    bus.on<FullscreenViewChanged>().listen((e) async {
+      if (e.view == 'alarm' && e.shown != _alarmHold) {
+        _alarmHold = e.shown;
+        await _applyWakelock();
+      }
+      if (e.view != 'intercom' || e.shown == _intercomHold) return;
+      _intercomHold = e.shown;
+      await _applyWakelock();
+    });
 
     if (_adaptiveOn) {
       // A session starts at Maximum brightness dimmed for the room as it
@@ -222,14 +250,11 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
       if (e.key == defs.adaptiveBrightness.key) {
         await _onAdaptiveSwitch();
       } else if (e.key == defs.adaptiveMaxBrightness.key && _adaptiveOn) {
-        // The floor is Minimum over Maximum, so the factor moves too.
+        // The factor is the curve over Maximum, so it moves too.
         final lux = _lastLux;
         if (lux != null) _factor = _curve.factor(lux);
         await _applyKnob();
-      } else if ((e.key == defs.adaptiveMinBrightness.key ||
-              e.key == defs.adaptiveDarkLux.key ||
-              e.key == defs.adaptiveBrightLux.key) &&
-          _adaptiveOn) {
+      } else if (_curveKeys.contains(e.key) && _adaptiveOn) {
         final lux = _lastLux;
         if (lux != null) await _moveFactor(_curve.factor(lux), force: true);
       }
@@ -353,6 +378,33 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
       )
       ..register(
         Command(
+          name: 'alarmBrightness',
+          description:
+              "An alarm's sunrise takes the panel: a level 0..1 to show, "
+              'or null to hand it back to whatever set it last.',
+          params: const {'level': '0..1, or null to let go'},
+          handler: (p) async {
+            final level = (p['level'] as num?)?.toDouble();
+            if (level == null) {
+              if (_alarmLevel == null) return const CommandResult.ok();
+              _alarmLevel = null;
+              final back = _heldLevel ?? _lastWrittenBeforeAlarm;
+              _heldLevel = null;
+              _lastWrittenBeforeAlarm = null;
+              if (back != null) await _write(back);
+              return const CommandResult.ok();
+            }
+            if (_alarmLevel == null) {
+              _lastWrittenBeforeAlarm = _lastWritten ?? await _readPanel();
+            }
+            _alarmLevel = level.clamp(0.0, 1.0);
+            await _write(_alarmLevel!, alarm: true);
+            return const CommandResult.ok();
+          },
+        ),
+      )
+      ..register(
+        Command(
           name: 'keepScreenAwake',
           description:
               'Hold the panel on regardless of the keep-awake setting. '
@@ -388,8 +440,9 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
   }
 
   /// Keep the screen on when the user's setting asks for it, the
-  /// screensaver is holding it, or hold mode is pinning the current view
-  /// (issue #266: a held recipe that goes dark defeats the point).
+  /// screensaver or the intercom is holding it, or hold mode is pinning the
+  /// current view (issue #266: a held recipe that goes dark defeats the
+  /// point).
   /// `FLAG_KEEP_SCREEN_ON` (via wakelock_plus) stops
   /// the OS display timeout — the panel stays powered, brightness is ours to
   /// set (0 for black), and the app is never backgrounded into a freeze.
@@ -397,6 +450,8 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
     final want =
         _settings.get(defs.keepScreenOn) ||
         _screensaverHold ||
+        _intercomHold ||
+        _alarmHold ||
         _settings.get(defs.haHoldMode);
     try {
       want ? await WakelockPlus.enable() : await WakelockPlus.disable();
@@ -540,21 +595,34 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
   double get _maxBrightness =>
       _settings.get(defs.adaptiveMaxBrightness).toDouble().clamp(0.0, 1.0);
 
-  /// The curve in factor terms: Minimum over Maximum is the floor, since
-  /// the same factor scales the screensaver's own level and it should
-  /// reach the same share of it in the dark.
-  AdaptiveCurve get _curve {
-    final max = _maxBrightness;
-    final min = _settings
+  /// The curve's settings other than Maximum brightness, which is also
+  /// the knob and has its own handling.
+  static final _curveKeys = {
+    defs.adaptiveMinBrightness.key,
+    defs.adaptiveDarkLux.key,
+    defs.adaptiveBrightLux.key,
+    defs.adaptivePoint2Position.key,
+    defs.adaptivePoint2Level.key,
+    defs.adaptivePoint3Position.key,
+    defs.adaptivePoint3Level.key,
+  };
+
+  /// The four-point curve from its settings. Its factor is the level over
+  /// Maximum brightness, since the same factor scales the screensaver's
+  /// own level and it should reach the same share of it in the dark.
+  AdaptiveCurve get _curve => AdaptiveCurve.fromSettings(
+    minLevel: _settings
         .get(defs.adaptiveMinBrightness)
         .toDouble()
-        .clamp(0.0, 1.0);
-    return AdaptiveCurve(
-      floor: max <= 0 ? 1.0 : (min / max).clamp(0.0, 1.0),
-      darkLux: _settings.get(defs.adaptiveDarkLux).toDouble(),
-      brightLux: _settings.get(defs.adaptiveBrightLux).toDouble(),
-    );
-  }
+        .clamp(0.0, 1.0),
+    maxLevel: _maxBrightness,
+    darkLux: _settings.get(defs.adaptiveDarkLux).toDouble(),
+    brightLux: _settings.get(defs.adaptiveBrightLux).toDouble(),
+    point2Position: _settings.get(defs.adaptivePoint2Position).toDouble(),
+    point2Level: _settings.get(defs.adaptivePoint2Level).toDouble(),
+    point3Position: _settings.get(defs.adaptivePoint3Position).toDouble(),
+    point3Level: _settings.get(defs.adaptivePoint3Level).toDouble(),
+  );
 
   static String _formatLux(double lux) => lux == lux.roundToDouble()
       ? lux.toInt().toString()
@@ -782,7 +850,12 @@ class ScreenManager extends Manager with WidgetsBindingObserver {
     return true;
   }
 
-  Future<bool> _write(double level) async {
+  Future<bool> _write(double level, {bool alarm = false}) async {
+    if (_alarmLevel != null && !alarm) {
+      // The sunrise owns the panel; this is what comes back after it.
+      _heldLevel = level.clamp(0.0, 1.0);
+      return true;
+    }
     final clamped = level.clamp(0.0, 1.0);
     _lastWritten = clamped;
     _lastWriteAt = DateTime.now();

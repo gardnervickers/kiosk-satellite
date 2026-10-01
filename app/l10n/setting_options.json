@@ -50,7 +50,8 @@
     "immich": "screensaverModeImmich",
     "website": "screensaverModeWebsite",
     "camera": "screensaverModeCamera",
-    "weather_mood": "screensaverWeatherMood"
+    "weather_mood": "screensaverWeatherMood",
+    "dashboard": "screensaverModeDashboard"
   },
   "screensaver.clock_style": {
     "digital": "screensaverStyleDigital",
@@ -278,5 +279,44 @@
     "medium": "screensaverFontMedium",
     "bold": "screensaverFontBold",
     "black": "screensaverFontBlack"
+  },
+  "voice.tts_output_mode": {
+    "announcement": "voiceOptionAnnouncement",
+    "normal_playback": "voiceOptionNormalPlayback"
+  },
+  "voice.wake_word_sensitivity": {
+    "slightly": "voiceOptionSlightly",
+    "moderately": "voiceOptionModerately",
+    "very": "voiceOptionVery"
+  },
+  "voice.theme": {
+    "auto": "haThemeAuto",
+    "light": "deviceThemeLight",
+    "dark": "deviceThemeDark"
+  },
+  "voice.skin": {
+    "default": "voiceVadDefault"
+  },
+  "alarms.snooze_minutes": {
+    "5": "alarmsOption5Minutes",
+    "10": "alarmsOption10Minutes",
+    "15": "alarmsOption15Minutes",
+    "20": "alarmsOption20Minutes",
+    "25": "alarmsOption25Minutes",
+    "30": "alarmsOption30Minutes"
+  },
+  "alarms.silence_after_minutes": {
+    "5": "alarmsOption5Minutes",
+    "10": "alarmsOption10Minutes",
+    "15": "alarmsOption15Minutes",
+    "20": "alarmsOption20Minutes",
+    "30": "alarmsOption30Minutes"
+  },
+  "alarms.sunrise_minutes": {
+    "10": "alarmsOption10Minutes",
+    "15": "alarmsOption15Minutes",
+    "20": "alarmsOption20Minutes",
+    "25": "alarmsOption25Minutes",
+    "30": "alarmsOption30Minutes"
   }
 }

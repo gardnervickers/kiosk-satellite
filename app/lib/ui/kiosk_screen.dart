@@ -1,12 +1,17 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'alarm_ring_overlay.dart';
+import 'alarms_overlay.dart';
 import '../core/permissions.dart';
 
 import '../app_container.dart';
@@ -52,6 +57,7 @@ import 'back_nav.dart';
 import 'key_nav.dart';
 import 'kiosk_drawer.dart';
 import 'sendspin_player_overlay.dart';
+import 'assist/assist_overlay.dart';
 import 'toast.dart';
 import 'settings_screen.dart';
 import 'voice_timer_overlay.dart';
@@ -163,15 +169,31 @@ class _KioskScreenState extends State<KioskScreen>
   DateTime? _backArmedUntil;
 
   static const _backAgainWindow = Duration(seconds: 3);
+  static const _backEcho = Duration(milliseconds: 200);
+
+  /// When the last back press ran the ladder, to drop its echo.
+  DateTime? _lastBackAt;
 
   /// One ladder for every back press — the predictive pop (the PopScope in
   /// build) and the KeyEvent path KioskLock routes here as KioskBackPressed
   /// land in the same place, so the two can never drift apart.
   void _handleBack() {
+    // Android 16 with targetSdk 36 hands a key-driven back to both paths
+    // at once when KioskLock swallows it (kiosk mode or the home role):
+    // the predictive callback Flutter registers for the PopScope, and the
+    // KeyEvent. The two land a few milliseconds apart, and ran the ladder
+    // twice: the first opened the menu, the second closed it again and
+    // stepped back, so a remote's back could never open the menu (issue
+    // #745). No hand presses back twice this fast.
+    final now = DateTime.now();
+    final last = _lastBackAt;
+    _lastBackAt = now;
+    if (last != null && now.difference(last) < _backEcho) return;
     if (_drawer.value == 0 &&
         !c.screensaver.isActive &&
         !c.launcher.visible.value &&
         !c.intercom.rosterVisible.value &&
+        !c.alarms.visible.value &&
         c.camera.activeViewId.value == null &&
         !c.kiosk.lockdownActive &&
         c.plugins.windows.value.isNotEmpty) {
@@ -187,7 +209,9 @@ class _KioskScreenState extends State<KioskScreen>
       drawerOpen: _drawer.value > 0,
       armed: armed,
       launcherVisible:
-          c.launcher.visible.value || c.intercom.rosterVisible.value,
+          c.launcher.visible.value ||
+          c.intercom.rosterVisible.value ||
+          c.alarms.visible.value,
       overlayUp: c.browser.overlayUrl.value != null,
       cameraViewUp: c.camera.activeViewId.value != null,
       cameraFocused: c.camera.focusedCameraId.value != null,
@@ -213,6 +237,7 @@ class _KioskScreenState extends State<KioskScreen>
       case BackAction.hideLauncher:
         c.launcher.visible.value = false;
         c.intercom.rosterVisible.value = false;
+        c.alarms.visible.value = false;
       case BackAction.dismissOverlay:
         // A link or rotation page covers the dashboard: back uncovers it.
         c.browser.dismissOverlay();
@@ -225,6 +250,11 @@ class _KioskScreenState extends State<KioskScreen>
         // restricted quick menu, never the full one.
         setState(() => _drawerRestricted = c.kiosk.locked);
         _drawer.fling(velocity: 1);
+        // Back is the remote's menu key (issue #745), so the arrows start
+        // on the first entry the way they did when left opened the menu.
+        // A touch-driven back leaves Flutter in touch highlight mode and
+        // the focus draws nothing.
+        _focusDrawer();
         _backArmedUntil = DateTime.now().add(_backAgainWindow);
         // No toast while the home role is held: a home screen's back has
         // no app to close and usually no history to step, so there is
@@ -306,7 +336,9 @@ class _KioskScreenState extends State<KioskScreen>
         (c.settings.get(defs.kioskAllowHold) && hasHold) ||
         (c.settings.get(defs.kioskAllowLockdown) &&
             c.settings.get(defs.lockdownMenu)) ||
-        (c.settings.get(defs.kioskAllowApps) && hasApps);
+        (c.settings.get(defs.kioskAllowApps) && hasApps) ||
+        (c.settings.get(defs.kioskAllowAlarms) &&
+            c.settings.get(defs.alarmsMenu));
   }
 
   /// Pull-to-refresh as the user experiences it: the Web Browsing toggle,
@@ -343,6 +375,10 @@ class _KioskScreenState extends State<KioskScreen>
   /// The next rebuilt WebView loads the start URL instead of picking up
   /// where the current page was (a token change, see _onSettingChanged).
   bool _rebuildFromStart = false;
+
+  /// Set when auto-login turns on: the seed replaces a login done by hand
+  /// once, on the first page that sees this marker.
+  String? _autoLoginReplace;
 
   /// Pull-to-refresh, Fully style. The native wrapper handles pages that fit
   /// the screen; scrollable pages never hand it the gesture (Chromium claims
@@ -466,9 +502,23 @@ class _KioskScreenState extends State<KioskScreen>
         e.key == defs.pinchToZoom.key ||
         e.key == defs.wsFilter.key ||
         e.key == defs.disableSuspend.key ||
-        e.key == defs.haAutoLogin.key ||
         e.key == defs.kioskDisableContextMenus.key) {
       setState(() => _webViewEpoch++);
+      return;
+    }
+    // Auto-login on reloads from the start URL: the page on screen is
+    // usually Home Assistant's login form, which never reads the seeded
+    // session. It also signs out a login done by hand, once, since turning
+    // it on asks for the token's user. Off reloads in place and the login
+    // form follows.
+    if (e.key == defs.haAutoLogin.key) {
+      setState(() {
+        _webViewEpoch++;
+        if (c.settings.get(defs.haAutoLogin)) {
+          _rebuildFromStart = true;
+          _autoLoginReplace = '${DateTime.now().microsecondsSinceEpoch}';
+        }
+      });
       return;
     }
     // A new long-lived token reaches the dashboard only through the
@@ -529,6 +579,7 @@ class _KioskScreenState extends State<KioskScreen>
         if (_settingsOpen) Navigator.of(context).popUntil((r) => r.isFirst);
         c.launcher.visible.value = false;
         c.intercom.rosterVisible.value = false;
+        c.alarms.visible.value = false;
       }
       return;
     }
@@ -558,6 +609,8 @@ class _KioskScreenState extends State<KioskScreen>
         e.key == defs.intercomEnabled.key ||
         e.key == defs.intercomMenu.key ||
         e.key == defs.kioskAllowIntercom.key ||
+        e.key == defs.kioskAllowAlarms.key ||
+        e.key == defs.alarmsMenu.key ||
         e.key == defs.remoteEnabled.key ||
         e.key == defs.remoteFleetDiscovery.key) {
       setState(() {});
@@ -593,6 +646,13 @@ class _KioskScreenState extends State<KioskScreen>
     // The satellite seed script is fixed at WebView creation, so a plain
     // reload re-runs the stale one — clearing the binding would be undone
     // at the next document start. Rebuild for fresh user scripts.
+    // Where Voice Satellite runs decides whether the dashboard may boot the
+    // integration's engine at all (the suppress script below), and user
+    // scripts are frozen at WebView creation.
+    if (e.key == defs.voiceRuntime.key) {
+      setState(() => _webViewEpoch++);
+      return;
+    }
     if (e.key == defs.haSatelliteEntity.key) {
       setState(() => _webViewEpoch++);
       return;
@@ -695,6 +755,7 @@ class _KioskScreenState extends State<KioskScreen>
       if (_settingsOpen) Navigator.of(context).popUntil((r) => r.isFirst);
       c.launcher.visible.value = false;
       c.intercom.rosterVisible.value = false;
+      c.alarms.visible.value = false;
       if (c.browser.overlayUrl.value != null) c.browser.dismissOverlay();
       if (c.camera.activeViewId.value != null) c.camera.hideView();
       unawaited(c.commands.execute('stopScreensaver', const {}));
@@ -707,6 +768,7 @@ class _KioskScreenState extends State<KioskScreen>
     c.browser.overlayUrl.addListener(_onOverlayChanged);
     c.launcher.visible.addListener(_onOverlayChanged);
     c.intercom.rosterVisible.addListener(_onOverlayChanged);
+    c.alarms.visible.addListener(_onOverlayChanged);
     c.plugins.windows.addListener(_onOverlayChanged);
     c.plugins.installed.addListener(_onOverlayChanged);
     c.homeLauncher.roleHeld.addListener(_onOverlayChanged);
@@ -952,7 +1014,16 @@ class _KioskScreenState extends State<KioskScreen>
     if (c.settings.get(defs.haAutoLogin) &&
         c.settings.get(defs.haToken).trim().isNotEmpty)
       UserScript(
-        source: buildHaAutoLoginScript(token: c.settings.get(defs.haToken))!,
+        source: buildHaAutoLoginScript(
+          token: c.settings.get(defs.haToken),
+          replace: _autoLoginReplace,
+        )!,
+        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+      ),
+    // Off, the seeded session goes too, so the page asks for a login.
+    if (!c.settings.get(defs.haAutoLogin))
+      UserScript(
+        source: haAutoLoginClearScript,
         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
       ),
     // The wizard's satellite choice, handed to Voice Satellite before its
@@ -960,7 +1031,16 @@ class _KioskScreenState extends State<KioskScreen>
     // assist_satellite, hydrates its server-side profile and starts. Only
     // seeded while the key is absent — a satellite changed in the page
     // afterwards must win over a stale wizard choice.
-    if (c.settings.get(defs.haSatelliteEntity).isNotEmpty)
+    // Native Voice Satellite owns the satellite: the integration's engine
+    // must never boot here, dashboard included, even while the integration
+    // is still installed (see vs_suppress_script).
+    if (c.voice.suppressPageEngine)
+      UserScript(
+        source: vsSuppressScript,
+        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+      ),
+    if (!c.voice.suppressPageEngine &&
+        c.settings.get(defs.haSatelliteEntity).isNotEmpty)
       UserScript(
         source:
             '''
@@ -1061,6 +1141,7 @@ class _KioskScreenState extends State<KioskScreen>
         c.kiosk.lockdownActive ||
         c.launcher.visible.value ||
         c.intercom.rosterVisible.value ||
+        c.alarms.visible.value ||
         c.camera.activeViewId.value != null ||
         c.plugins.windows.value.isNotEmpty;
     if (capture == _lastNavCapture) return;
@@ -1172,6 +1253,7 @@ class _KioskScreenState extends State<KioskScreen>
       overlayUp:
           c.launcher.visible.value ||
           c.intercom.rosterVisible.value ||
+          c.alarms.visible.value ||
           c.browser.overlayUrl.value != null ||
           c.camera.activeViewId.value != null,
       // Any route above this one: settings, and every dialog — the exit
@@ -1180,19 +1262,10 @@ class _KioskScreenState extends State<KioskScreen>
           _settingsOpen || !(ModalRoute.of(context)?.isCurrent ?? true),
       drawerOpen: _drawer.value > 0,
       drawerFocused: _drawerFocus.hasFocus,
-      openAllowed: !c.kiosk.locked || _quickMenuAvailable,
-      isLeft: key == LogicalKeyboardKey.arrowLeft,
     )) {
       case KeyNavAction.pass:
         return false;
       case KeyNavAction.swallow:
-        return true;
-      case KeyNavAction.openDrawer:
-        // Mirrors the edge swipe: opening while locked earns only the
-        // restricted quick menu, never the full one.
-        setState(() => _drawerRestricted = c.kiosk.locked);
-        _drawer.fling(velocity: 1);
-        _focusDrawer();
         return true;
       case KeyNavAction.focusDrawer:
         _focusDrawer();
@@ -1332,6 +1405,7 @@ class _KioskScreenState extends State<KioskScreen>
     c.browser.overlayUrl.removeListener(_onOverlayChanged);
     c.launcher.visible.removeListener(_onOverlayChanged);
     c.intercom.rosterVisible.removeListener(_onOverlayChanged);
+    c.alarms.visible.removeListener(_onOverlayChanged);
     c.plugins.windows.removeListener(_onOverlayChanged);
     c.plugins.installed.removeListener(_onOverlayChanged);
     c.homeLauncher.roleHeld.removeListener(_onOverlayChanged);
@@ -1548,11 +1622,18 @@ class _KioskScreenState extends State<KioskScreen>
                   // twin: full screen, below the screensaver, closed by
                   // the manager when a call starts.
                   IntercomRosterOverlay(container: c),
+                  // The alarm list, the launcher's twin again: full
+                  // screen, below the screensaver.
+                  AlarmsOverlay(container: c),
                   // The screensaver covers both planes — it owns the whole
                   // display, drawer open or not.
-                  ScreensaverOverlay(container: c),
+                  // Paused under the native voice overlay, which
+                  // draws over it instead of dismissing it.
+                  PausedUnder(
+                    paused: c.screensaver.renderPaused,
+                    child: ScreensaverOverlay(container: c),
+                  ),
                   CameraViewOverlay(container: c),
-                  VoiceTimerOverlay(container: c),
                   // The camera preview a face wake leaves behind
                   // (discussion #371): over the screensaver, whose fade
                   // out it appears through, and answering no touch.
@@ -1572,6 +1653,16 @@ class _KioskScreenState extends State<KioskScreen>
                   // An announcement from Home Assistant: its own card, with
                   // the spoken text, in the same slot.
                   AnnouncementOverlay(container: c),
+                  // The black timeout cover while a voice turn shows: the
+                  // turn draws over it (issue #746). Outside a turn it
+                  // sits above everything below.
+                  ScreensaverBlankOverlay(container: c, underVoice: true),
+                  // Native Voice Satellite: the assist overlay, in the same
+                  // slot, over the screensaver and the camera views.
+                  AssistOverlay(container: c),
+                  // The timer pills stay over the voice overlay, as Voice
+                  // Satellite stacks them over its own.
+                  VoiceTimerOverlay(container: c),
                   ScreensaverBlankOverlay(container: c),
                   // Lockdown Mode's touch shield: topmost, above every
                   // overlay, so nothing on screen is tappable while it
@@ -1583,6 +1674,10 @@ class _KioskScreenState extends State<KioskScreen>
                     LockdownShield(
                       blackout: c.settings.get(defs.lockdownBlackout),
                     ),
+                  // An alarm on its own view: over everything, the lockdown
+                  // shield included, since Stop has to answer. Its sunrise
+                  // covers the screensaver and the dark panel too.
+                  AlarmRingOverlay(container: c),
                   // A fleet invitation: above the shield, since answering
                   // it is an admin act the shield must not swallow.
                   FleetInviteOverlay(container: c),
@@ -2536,6 +2631,88 @@ class _WebViewMissingNotice extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Shows [child] live, or while [paused] as a still picture of its last
+/// frame, with the live tree offstage and its tickers stopped. Impeller
+/// keeps no raster cache, so a merely idle screensaver under the voice
+/// overlay would still be drawn again, filters and all, every frame the
+/// overlay moves; the picture costs one texture.
+class PausedUnder extends StatefulWidget {
+  const PausedUnder({super.key, required this.paused, required this.child});
+
+  final ValueListenable<bool> paused;
+  final Widget child;
+
+  @override
+  State<PausedUnder> createState() => _PausedUnderState();
+}
+
+class _PausedUnderState extends State<PausedUnder> {
+  final _boundary = GlobalKey();
+  ui.Image? _still;
+  bool _paused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.paused.addListener(_changed);
+  }
+
+  @override
+  void dispose() {
+    widget.paused.removeListener(_changed);
+    _still?.dispose();
+    super.dispose();
+  }
+
+  void _changed() {
+    final paused = widget.paused.value;
+    if (paused == _paused || !mounted) return;
+    ui.Image? still;
+    if (paused) {
+      // The frame on screen right now, taken before anything changes.
+      final boundary =
+          _boundary.currentContext?.findRenderObject()
+              as RenderRepaintBoundary?;
+      try {
+        still = boundary?.toImageSync(
+          pixelRatio: MediaQuery.devicePixelRatioOf(context),
+        );
+      } catch (_) {
+        still = null;
+      }
+    }
+    setState(() {
+      _paused = paused;
+      _still?.dispose();
+      _still = still;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final still = _paused ? _still : null;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        if (still != null)
+          IgnorePointer(child: RawImage(image: still, fit: BoxFit.fill)),
+        Offstage(
+          offstage: still != null,
+          child: TickerMode(
+            enabled: !_paused,
+            // The screensaver's root is Positioned: it needs a Stack
+            // above it.
+            child: RepaintBoundary(
+              key: _boundary,
+              child: Stack(fit: StackFit.expand, children: [widget.child]),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

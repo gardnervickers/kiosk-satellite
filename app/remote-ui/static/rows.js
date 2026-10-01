@@ -1,5 +1,6 @@
 import { confirmRemoteProtocol } from './tls.js';
-import { esphomeText, launcherText, messageLanguage } from './localization.js';
+import { brightnessCurveRow } from './brightness_curve.js';
+import { esphomeText, launcherText, messageLanguage, voiceText } from './localization.js';
 import { intercomError, mediaText, cameraText, cameraError, deviceText, haText, screensaverText, screensaverError, t } from './localization.js';
 import { watchUpdates } from './live.js';
 import {
@@ -22,6 +23,7 @@ import {
   openMediaBrowser,
 } from './pickers.js';
 import { loadSettings, refreshRealMacNote, updatePersonSensorRows, updateRtspRows } from './settings.js';
+import { dashboardViewEntries, pickDashboardView } from './views.js';
 import {
   attachSlider,
   dateBox,
@@ -285,8 +287,8 @@ export function settingRow(s) {
       || s.key === 'screensaver.dismiss_on_face') {
       updateFaceRows();
     }
-    // The Person Detection page's status row answers for its own switch.
-    if (s.key === 'screensaver.dismiss_on_person') updatePersonSensorRows();
+    // The person sensor pages' status rows answer for their own switches.
+    if (s.key === 'screensaver.dismiss_on_person' || s.key === 'person.sensor') updatePersonSensorRows();
     if (s.key === 'camera.rtsp.enabled' || s.key === 'camera.rtsp.protocol') updateRtspRows();
     // The hints under the brightness sliders come and go with the
     // adaptive brightness switch (issue #343). After the gated sync, so
@@ -300,6 +302,21 @@ export function settingRow(s) {
       await refreshRealMacNote();
     }
   };
+
+  // The adaptive brightness curve (issue #742): one editor for its
+  // settings, in Minimum brightness's row, as on the device. The other
+  // three ends draw no row of their own; the editor's chips carry their
+  // keys, so their live updates and search hits land on it.
+  if (s.key === 'screen.adaptive_min_brightness') {
+    return brightnessCurveRow(row, {
+      showError: (message) => showRowError(row, message),
+      clearError: () => clearRowError(row),
+    });
+  }
+  if (['screen.adaptive_max_brightness', 'screen.adaptive_dark_lux',
+    'screen.adaptive_bright_lux'].includes(s.key)) {
+    return document.createDocumentFragment();
+  }
 
   // The clock's background photo deliberately has no special case: the
   // generic text input edits the file path directly, the same contract as
@@ -368,6 +385,45 @@ export function settingRow(s) {
       }
     };
     load();
+    return row;
+  }
+  // The Home Assistant Dashboard screensaver's view is picked from the
+  // instance's dashboards, the same modal the Go to a dashboard view
+  // gesture uses, mirroring the device's row.
+  if (s.key === 'screensaver.dashboard_view') {
+    // The live value: save() writes the confirmed pick into the cache.
+    const current = () => (state.settings || []).find((o) => o.key === s.key)?.value ?? s.value ?? '';
+    const val = document.createElement('span');
+    val.className = 'device';
+    val.style.cssText =
+      'flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap';
+    const paint = () => { val.textContent = current() || screensaverText('Not set'); };
+    paint();
+    const btn = document.createElement('button');
+    btn.className = 'btn-ghost'; btn.textContent = screensaverText('Select dashboard');
+    btn.style.flex = 'none';
+    btn.addEventListener('click', async () => {
+      const entries = await dashboardViewEntries();
+      if (!entries.length) {
+        await messageBox({
+          title: screensaverText('Could not list dashboards'),
+          message: screensaverText('Is Home Assistant connected?'),
+        });
+        return;
+      }
+      const picked = await pickDashboardView(screensaverText('Select dashboard'),
+        entries, current());
+      if (!picked) return;
+      await save(picked);
+      paint();
+    });
+    bindUpdate(val, paint);
+    // One wrapper so the value + button occupy a single grid cell on mobile.
+    const controls = document.createElement('div');
+    controls.style.cssText =
+      'display:flex; gap:10px; align-items:center; min-width:0; max-width:60%; flex:0 1 auto';
+    controls.append(val, btn);
+    row.appendChild(controls);
     return row;
   }
   // The screensaver's media is browsed from Home Assistant, not typed, the
@@ -835,7 +891,8 @@ export function settingRow(s) {
     const CORNERS = [['top_left', screensaverText('Top left')], ['top_right', screensaverText('Top right')],
       ['bottom_left', screensaverText('Bottom left')], ['bottom_right', screensaverText('Bottom right')]];
     const TYPES = [['clock', screensaverText('Small clock')], ['weather', screensaverText('Weather')],
-      ['battery', screensaverText('Battery')], ['entity', screensaverText('Entity')]];
+      ['battery', screensaverText('Battery')], ['entity', screensaverText('Entity')],
+      ['alarm', t('alarmsNextWidget')]];
     const DEFAULTS = {
       clock: { color: '250,250,250', scale: 0, font: 'default',
         font_weight: 'default', h24: false, date: false },
@@ -847,6 +904,8 @@ export function settingRow(s) {
         font_weight: 'default', percent: true, low: false },
       entity: { entity: '', name: '', label: '', attribute: '',
         show_name: true, color: '250,250,250', scale: 0, font: 'default',
+        font_weight: 'default' },
+      alarm: { color: '250,250,250', scale: 0, font: 'default',
         font_weight: 'default' },
     };
     // The typeface and weight pickers, the clock screensaver's vocabulary
@@ -997,6 +1056,12 @@ export function settingRow(s) {
             screensaverText('Stay hidden until the charge drops to 20 percent.'));
           typeBlock.append(refs.color.wrap, refs.scale.wrap, refs.font.wrap,
             refs.weight.wrap, refs.percent.wrap, refs.low.wrap);
+          return;
+        }
+        // The next alarm: nothing of its own, the look every widget has.
+        if (type === 'alarm') {
+          typeBlock.append(refs.color.wrap, refs.scale.wrap, refs.font.wrap,
+            refs.weight.wrap);
           return;
         }
         if (type === 'entity') {
@@ -1189,6 +1254,8 @@ export function settingRow(s) {
             entryConfig = { color, scale, font, font_weight,
               percent: refs.percent.input.checked,
               low: refs.low.input.checked };
+          } else if (type === 'alarm') {
+            entryConfig = { color, scale, font, font_weight };
           } else if (type === 'entity') {
             if (!config.entity) return { ok: false, error: screensaverText('Pick an entity.') };
             entryConfig = { entity: config.entity,
@@ -1232,7 +1299,7 @@ export function settingRow(s) {
         }, false, 'delete'),
       ],
       {
-        icon: ['weather', 'battery', 'entity'].includes(e.type)
+        icon: ['weather', 'battery', 'entity', 'alarm'].includes(e.type)
           ? e.type : 'clock',
         onClick: () => editWidget(e),
       },
@@ -1484,6 +1551,8 @@ export function settingRow(s) {
         if (h === 0) return t('haMinutes', {minutes: String(m)});
         return m === 0 ? t('haHours', {hours: String(h)}) : t('haHoursMinutes', {hours: String(h), minutes: String(m)});
       }
+      // The overlay's backdrop: the far left keeps the skin's own.
+      if (s.key === 'voice.background_opacity' && Number(v) < 0) return voiceText('Skin default');
       return s.unit === '%'
         ? `${Math.round(s.max <= 1 ? v * 100 : v)}%`
         : `${v}${s.unit || ''}`;
@@ -1562,7 +1631,7 @@ export function settingRow(s) {
       sel.disabled = true;
     }
     if (s.key === 'screensaver.mode' && !state.haConfigured)
-      opts = opts.filter((o) => o !== 'media' && o !== 'weather_mood');
+      opts = opts.filter((o) => o !== 'media' && o !== 'weather_mood' && o !== 'dashboard');
     opts.forEach((o) => {
       const opt = document.createElement('option');
       opt.value = o;

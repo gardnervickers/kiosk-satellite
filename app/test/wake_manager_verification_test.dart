@@ -23,7 +23,9 @@ class _Engine extends WakeWordEngine {
   String? handoffError;
 
   @override
-  Set<WakeWordEngineType> get supportedEngines => {WakeWordEngineType.vsWakeWord};
+  Set<WakeWordEngineType> get supportedEngines => {
+    WakeWordEngineType.vsWakeWord,
+  };
   @override
   bool get running => isRunning;
   @override
@@ -34,34 +36,46 @@ class _Engine extends WakeWordEngine {
     candidate = null;
     return result;
   }
+
   @override
   void clearWakeHandoff() => clears++;
   @override
   String? get wakeHandoffError => handoffError;
   @override
-  Future<void> start({required WakeWordConfig config,
-      required DetectionCallback onDetection,
-      StopDetectionCallback? onStopDetection,
-      EngineFailureCallback? onFailure}) async {
+  Future<void> start({
+    required WakeWordConfig config,
+    required DetectionCallback onDetection,
+    StopDetectionCallback? onStopDetection,
+    EngineFailureCallback? onFailure,
+  }) async {
     isRunning = true;
     detection = onDetection;
   }
+
   @override
   Future<void> stop() async => isRunning = false;
   @override
   Future<void> resumeDetection() async => resumes++;
 
-  Future<void> fire() => detection!(const WakeWordModelRef(
-      id: 'hey_luna', wakeWord: 'Hey Luna', manifestUrl: 'http://ha/model'));
+  Future<void> fire() => detection!(
+    const WakeWordModelRef(
+      id: 'hey_luna',
+      wakeWord: 'Hey Luna',
+      manifestUrl: 'http://ha/model',
+    ),
+  );
 }
 
 class _Verifier extends WakeVerifier {
   Future<WakeVerifyReply> Function()? answer;
   int calls = 0;
   @override
-  Future<WakeVerifyReply> verify({required String homeAssistantUrl,
-      required String token, required String endpointId,
-      required Uint8List pcm}) {
+  Future<WakeVerifyReply> verify({
+    required String homeAssistantUrl,
+    required String token,
+    required String endpointId,
+    required Uint8List pcm,
+  }) {
     calls++;
     expect(homeAssistantUrl, 'http://ha.example:8123');
     expect(token, 'test-token');
@@ -80,6 +94,7 @@ void main() {
   late _Engine engine;
   late _Verifier verifier;
   late List<WakeWordDetected> events;
+  Completer<void>? screenBlocked;
   var screenPokes = 0;
 
   setUp(() async {
@@ -90,24 +105,42 @@ void main() {
     await settings.init();
     engine = _Engine();
     verifier = _Verifier();
-    manager = WakeWordManager(bus, commands, Logger(), settings,
-        engines: {WakeWordEngineType.vsWakeWord: engine}, verifier: verifier);
+    manager = WakeWordManager(
+      bus,
+      commands,
+      Logger(),
+      settings,
+      engines: {WakeWordEngineType.vsWakeWord: engine},
+      verifier: verifier,
+    );
     await manager.init();
     events = [];
     bus.on<WakeWordDetected>().listen(events.add);
     screenPokes = 0;
-    commands.register(Command(name: 'screenOn', description: 'test',
+    screenBlocked = null;
+    commands.register(
+      Command(
+        name: 'screenOn',
+        description: 'test',
         handler: (_) async {
           screenPokes++;
+          await screenBlocked?.future;
           return const CommandResult.ok();
-        }));
+        },
+      ),
+    );
     await settings.set(defs.haUrl, 'http://ha.example:8123');
     await settings.set(defs.haToken, 'test-token');
     await settings.set(defs.wakeWordVerificationEndpointId, 'voice-garage');
     await commands.execute('setWakeWordConfig', const {
       'engine': 'vsWakeWord',
-      'models': [{'id': 'hey_luna', 'wakeWord': 'Hey Luna',
-        'manifestUrl': 'http://ha.example:8123/model'}],
+      'models': [
+        {
+          'id': 'hey_luna',
+          'wakeWord': 'Hey Luna',
+          'manifestUrl': 'http://ha.example:8123/model',
+        },
+      ],
     });
   });
 
@@ -137,7 +170,10 @@ void main() {
     expect(engine.clears, 1);
     expect(engine.resumes, greaterThan(0));
     expect(manager.listening, isTrue);
-    expect((manager.describeState()['wakeVerification'] as Map)['reason'], 'no_match');
+    expect(
+      (manager.describeState()['wakeVerification'] as Map)['reason'],
+      'no_match',
+    );
   });
 
   test('acceptance delays screen and event until verifier responds', () async {
@@ -170,19 +206,45 @@ void main() {
     expect(events, isEmpty);
   });
 
-  test('accepted result still fails closed if command handoff overflowed', () async {
-    await settings.set(defs.wakeWordVerificationEnabled, true);
-    await Future<void>.delayed(Duration.zero);
-    verifier.answer = () async {
-      engine.handoffError = 'Wake audio handoff exceeded the buffer';
-      return const WakeVerifyReply(true, 'matched', 30);
-    };
-    await engine.fire();
-    expect(screenPokes, 0);
-    expect(events, isEmpty);
-    expect(engine.clears, 1);
-    expect(manager.listening, isTrue);
-    expect((manager.describeState()['wakeVerification'] as Map)['reason'],
-        'handoff_overflow');
-  });
+  test(
+    'manual page action cancels accepted wake before event dispatch',
+    () async {
+      await settings.set(defs.wakeWordVerificationEnabled, true);
+      await Future<void>.delayed(Duration.zero);
+      screenBlocked = Completer<void>();
+      verifier.answer = () async => const WakeVerifyReply(true, 'matched', 30);
+      final detection = engine.fire();
+      for (var i = 0; i < 20 && screenPokes == 0; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(screenPokes, 1);
+      expect(events, isEmpty);
+      manager.setActive(false);
+      screenBlocked!.complete();
+      await detection;
+      expect(events, isEmpty);
+      expect(engine.clears, 1);
+    },
+  );
+
+  test(
+    'accepted result still fails closed if command handoff overflowed',
+    () async {
+      await settings.set(defs.wakeWordVerificationEnabled, true);
+      await Future<void>.delayed(Duration.zero);
+      verifier.answer = () async {
+        engine.handoffError = 'Wake audio handoff exceeded the buffer';
+        return const WakeVerifyReply(true, 'matched', 30);
+      };
+      await engine.fire();
+      expect(screenPokes, 0);
+      expect(events, isEmpty);
+      expect(engine.clears, 1);
+      expect(manager.listening, isTrue);
+      expect(
+        (manager.describeState()['wakeVerification'] as Map)['reason'],
+        'handoff_overflow',
+      );
+    },
+  );
 }

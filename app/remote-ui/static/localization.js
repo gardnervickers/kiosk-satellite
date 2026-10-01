@@ -112,6 +112,7 @@ export function settingsPageText(category, english) {
     : ['Plugins', 'plugins'].includes(category) ? pluginText(english)
     : ['Kiosk', 'kiosk', 'Home', 'home', 'Lockdown', 'lockdown'].includes(category) ? kioskText(english)
     : category === 'Intercom' || category === 'intercom' ? (english === 'Answer' ? t('intercomAnswerSection') : english === 'Talk' ? t('intercomTalkSection') : intercomText(english))
+    : category === 'Alarms' || category === 'alarms' ? (english === 'Defaults' ? t('alarmsDefaultsSection') : english)
     : category === 'Sendspin' || category === 'sendspin' ? mediaText(english) : english;
 }
 
@@ -173,9 +174,15 @@ export function localizeSetting(setting) {
     placeholder: setting.placeholderMessageId ? t(setting.placeholderMessageId, {}, setting.englishPlaceholder ?? setting.placeholder) : setting.placeholder,
     englishTitle,
     englishDescription,
-    title: setting.titleMessageId ? t(setting.titleMessageId, {}, englishTitle) : setting.title,
-    description: setting.descriptionMessageId
-      ? t(setting.descriptionMessageId, {}, englishDescription) : setting.description,
+    title: setting.key === 'voice.timer_named_phrase'
+      ? t('settingVoiceTimerNamedPhraseTitle', {}, englishTitle)
+      : setting.titleMessageId ? t(setting.titleMessageId, {}, englishTitle) : setting.title,
+    // Its description shows the {name} token itself, which a settings
+    // message cannot carry: the token goes in as the placeholder's value.
+    description: setting.key === 'voice.timer_named_phrase'
+      ? t('settingVoiceTimerNamedPhraseDescription', { name: '{name}' }, englishDescription)
+      : setting.descriptionMessageId
+        ? t(setting.descriptionMessageId, {}, englishDescription) : setting.description,
   };
 }
 

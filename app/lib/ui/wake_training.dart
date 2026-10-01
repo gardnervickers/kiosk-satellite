@@ -261,10 +261,11 @@ class _WakeTrainingDialogState extends State<_WakeTrainingDialog> {
                             await _store.delete(clip);
                             await _refresh();
                           } catch (e) {
-                            if (mounted)
+                            if (mounted) {
                               setState(
                                 () => _error = 'Could not delete clip: $e',
                               );
+                            }
                           }
                         },
                 ),

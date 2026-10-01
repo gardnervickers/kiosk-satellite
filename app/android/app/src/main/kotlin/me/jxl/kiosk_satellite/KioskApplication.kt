@@ -54,6 +54,7 @@ class KioskApplication : Application(), CameraXConfig.Provider {
 
     private lateinit var micRecorder: MicRecorder
     private lateinit var background: BackgroundBridge
+    private lateinit var alarms: AlarmBridge
     private lateinit var deviceDetails: DeviceDetails
     private lateinit var brightness: BrightnessBridge
     private lateinit var sendspin: SendspinBridge
@@ -69,6 +70,8 @@ class KioskApplication : Application(), CameraXConfig.Provider {
     private lateinit var plugins: me.jxl.kiosk_satellite.plugins.PluginBridge
     private lateinit var fleet: FleetBridge
     private lateinit var intercomAudio: IntercomAudio
+    private lateinit var mediaSessions: MediaSessionBridge
+    private lateinit var voiceIntents: VoiceIntentBridge
 
     override fun onCreate() {
         super.onCreate()
@@ -127,6 +130,7 @@ class KioskApplication : Application(), CameraXConfig.Provider {
         audioRouting = AudioRoutingBridge(applicationContext, messenger)
         micRecorder = MicRecorder(applicationContext, messenger)
         background = BackgroundBridge(applicationContext, messenger)
+        alarms = AlarmBridge(applicationContext, messenger)
         deviceDetails = DeviceDetails(applicationContext, messenger)
         brightness = BrightnessBridge(applicationContext, messenger)
         sendspin = SendspinBridge(applicationContext, messenger)
@@ -134,6 +138,7 @@ class KioskApplication : Application(), CameraXConfig.Provider {
         apkInstaller = ApkInstaller(applicationContext, messenger)
         lightSensor = LightSensor(applicationContext, messenger)
         proximitySensor = ProximitySensor(applicationContext, messenger)
+        LogTail(messenger)
         locationSensor = LocationSensor(applicationContext, messenger)
         haptics = HapticsBridge(applicationContext, messenger)
         tapSound = TapSoundBridge(applicationContext, messenger)
@@ -141,6 +146,8 @@ class KioskApplication : Application(), CameraXConfig.Provider {
         TlsBridge(applicationContext, messenger)
         fleet = FleetBridge(applicationContext, messenger)
         intercomAudio = IntercomAudio(applicationContext, messenger)
+        mediaSessions = MediaSessionBridge(applicationContext, messenger)
+        voiceIntents = VoiceIntentBridge(applicationContext, messenger)
         plugins = me.jxl.kiosk_satellite.plugins.PluginBridge(applicationContext, messenger)
     }
 }
