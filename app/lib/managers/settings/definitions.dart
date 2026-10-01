@@ -4953,6 +4953,29 @@ const wakeWordPreferFp32 = SettingDef<bool>(
   dependsOn: 'wake_word.enabled',
 );
 
+/// Per-device pilot. Other Portals retain the current wake path by default.
+const wakeWordVerificationEnabled = SettingDef<bool>(
+  key: 'wake_word.verification_enabled',
+  type: SettingType.boolean,
+  defaultValue: false,
+  title: 'Verify wake phrase',
+  description: 'Verify native vsWakeWord detections before waking the screen.',
+  category: 'Voice Satellite',
+  hidden: true,
+  perDevice: true,
+);
+
+const wakeWordVerificationEndpointId = SettingDef<String>(
+  key: 'wake_word.verification_endpoint_id',
+  type: SettingType.string,
+  defaultValue: '',
+  title: 'Wake verification endpoint ID',
+  description: 'The Luna endpoint ID used by the Home Assistant verifier.',
+  category: 'Voice Satellite',
+  hidden: true,
+  perDevice: true,
+);
+
 const wakeWordBackground = SettingDef<bool>(
   key: 'wake_word.background',
   type: SettingType.boolean,
@@ -8464,6 +8487,8 @@ const List<SettingDef<Object>> allSettings = [
   screensaverSchedule,
   wakeWordEnabled,
   wakeWordPreferFp32,
+  wakeWordVerificationEnabled,
+  wakeWordVerificationEndpointId,
   wakeWordBackground,
   wakeWordReturnToBackground,
   wakeWordResumeTimeoutSeconds,

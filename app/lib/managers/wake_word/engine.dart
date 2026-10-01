@@ -324,6 +324,9 @@ abstract class WakeWordEngine {
   /// PCM16, or null when nothing is being recorded.
   Uint8List? recentAudio(Duration length) => null;
 
+  /// Discard audio heard before an explicit recording starts.
+  void clearRecentAudio() {}
+
   /// Near misses as the detector spots them: a wake word that scored within
   /// reach of its threshold and fell back without firing, with its peak
   /// score and threshold in [detail]. Always reported by engines that can;
@@ -336,6 +339,15 @@ abstract class WakeWordEngine {
   /// threshold and whatever else the engine knows), or null. Read by the
   /// detection callback, which runs before the next detection can land.
   Map<String, Object?>? get lastDetection => null;
+
+  /// Capture a causal three-second wake candidate on the mic timeline.
+  /// Disabled on ordinary devices; a null candidate fails verification closed.
+  set captureWakeCandidate(bool enabled) {}
+  Uint8List? takeWakeCandidate() => null;
+
+  /// Discard a rejected turn's pinned post-wake audio.
+  void clearWakeHandoff() {}
+  String? get wakeHandoffError => null;
 
   /// Pause/resume *detection* without tearing the engine down. The mic stays
   /// open and the models stay loaded, so resuming is instant — as opposed to

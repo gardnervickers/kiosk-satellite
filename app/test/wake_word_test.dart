@@ -25,6 +25,10 @@ const _granted = 1;
 class _FakeEngine extends WakeWordEngine {
   bool _running = false;
   bool streamOpen = false;
+  int clears = 0;
+  final testerModes = <bool>[];
+  DetectionCallback? detection;
+  int resumes = 0;
   bool failStream = false;
 
   @override
@@ -36,6 +40,17 @@ class _FakeEngine extends WakeWordEngine {
   bool get running => _running;
 
   @override
+  void clearRecentAudio() => clears++;
+
+  @override
+  void setTelemetry(bool enabled, {bool tester = false}) {
+    testerModes.add(enabled && tester);
+  }
+
+  @override
+  Future<void> resumeDetection() async { resumes++; }
+
+  @override
   Future<void> start({
     required WakeWordConfig config,
     required DetectionCallback onDetection,
@@ -43,6 +58,7 @@ class _FakeEngine extends WakeWordEngine {
     EngineFailureCallback? onFailure,
   }) async {
     _running = true;
+    detection = onDetection;
   }
 
   @override
@@ -291,6 +307,31 @@ void main() {
       final state = await commands.execute('getWakeWordState', const {});
       return (state.data as Map)['active'] as bool;
     }
+
+    test('training capture holds wake actions and clears earlier audio', () {
+      expect(wakeWord.beginTrainingClip(), isFalse);
+      wakeWord.startTest();
+      expect(wakeWord.beginTrainingClip(), isTrue);
+      expect(engine.clears, 1);
+      expect(engine.testerModes.last, isTrue);
+      wakeWord.stopTest();
+      expect(engine.testerModes.last, isFalse);
+      expect(wakeWord.beginTrainingClip(), isFalse);
+    });
+
+    test('an in-flight detection cannot start a turn after the tester opens', () async {
+      final wakes = <WakeWordDetected>[];
+      final sub = bus.on<WakeWordDetected>().listen(wakes.add);
+      addTearDown(sub.cancel);
+      wakeWord.startTest();
+      await engine.detection!(const WakeWordModelRef(
+        id: 'okay_nabu', wakeWord: 'Okay Nabu', manifestUrl: 'http://ha/model.json'));
+      expect(wakes, isEmpty);
+      expect(engine.resumes, greaterThan(0));
+      expect(await active(), isTrue);
+      wakeWord.stopTest();
+      expect(engine.testerModes.last, isFalse);
+    });
 
     for (final scenario in [
       'wake word',

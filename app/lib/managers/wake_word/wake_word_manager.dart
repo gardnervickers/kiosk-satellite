@@ -17,6 +17,8 @@ import 'engine.dart';
 import 'model_cache.dart';
 import 'system_permissions.dart';
 import 'wake_diagnostics.dart';
+import 'wake_verification_gate.dart';
+import 'wake_verifier.dart';
 import 'mww/mww_engine.dart';
 import 'mww/mww_probe.dart';
 import 'oww/oww_engine.dart';
@@ -58,12 +60,31 @@ class WakeWordManager extends Manager
     this._settings, {
     @visibleForTesting Map<WakeWordEngineType, WakeWordEngine>? engines,
     WakeWordDiagnostics? diagnostics,
+    WakeVerifier? verifier,
   }) : _engines = {...?engines},
-       diagnostics = diagnostics ?? WakeWordDiagnostics();
+       diagnostics = diagnostics ?? WakeWordDiagnostics(),
+       _verifier = verifier ?? WakeVerifier();
 
   /// The last few activations with a clip of each, while the user has wake
   /// word diagnostics on. Both settings UIs list them.
   final WakeWordDiagnostics diagnostics;
+  final WakeVerifier _verifier;
+  final WakeVerificationGate _verificationGate = WakeVerificationGate();
+  int _verificationEpoch = 0;
+  bool _verifying = false;
+  Map<String, Object?>? _lastVerification;
+
+  bool get _verificationEnabled =>
+      _settings.get(defs.wakeWordVerificationEnabled) &&
+      _config?.engine == WakeWordEngineType.vsWakeWord;
+
+  void _cancelVerification() {
+    _verificationEpoch++;
+    _verificationGate.cancel();
+    if (!_verifying) return;
+    _engine.clearWakeHandoff();
+    _verifying = false;
+  }
 
   final SettingsManager _settings;
 
@@ -245,6 +266,12 @@ class WakeWordManager extends Manager
   /// Reference counted so overlapping testers (device + remote) share one
   /// feed.
   void startTest() {
+    final wasVerifying = _verifying;
+    _cancelVerification();
+    if (wasVerifying) {
+      _active = true;
+      unawaited(_sync());
+    }
     _testers++;
     _applyTelemetry();
   }
@@ -339,6 +366,13 @@ class WakeWordManager extends Manager
   /// Up to [length] of what the engine heard last, as 16 kHz mono PCM16, or
   /// null when it is not recording (no tester open, diagnostics off).
   Uint8List? recentAudio(Duration length) => _engine.recentAudio(length);
+
+  /// Start a user-requested clip at this instant, excluding prior room audio.
+  bool beginTrainingClip() {
+    if (!_engine.running || _testers == 0) return false;
+    _engine.clearRecentAudio();
+    return true;
+  }
 
   /// Point the active engine's telemetry at our stream (or unhook it).
   /// Re-run whenever the running engine changes, so requesting a test
@@ -497,6 +531,9 @@ class WakeWordManager extends Manager
   }
 
   void _onEngineFailure(EngineFailure kind, String detail) {
+    final wasVerifying = _verifying;
+    _cancelVerification();
+    if (wasVerifying) _active = true;
     if (kind == EngineFailure.crashed && _crashes <= _maxCrashRestarts) {
       _onEngineCrash(detail);
       return;
@@ -698,6 +735,7 @@ class WakeWordManager extends Manager
       final id => _engine.modelPrecision(id),
     },
     'modelPrecision': modelPrecision,
+    'wakeVerification': _lastVerification,
   };
 
   @override
@@ -724,6 +762,10 @@ class WakeWordManager extends Manager
     });
     bus.on<VoiceInteractionChanged>().listen((e) {
       if (e.reason != 'intercom' || e.active == _intercomHold) return;
+      if (e.active && _verifying) {
+        _cancelVerification();
+        _active = true;
+      }
       _intercomHold = e.active;
       log.info(
         name,
@@ -770,6 +812,16 @@ class WakeWordManager extends Manager
         // Models are fetched at engine start; a precision flip needs the
         // same stop/start to re-download as a mic change does.
         _restartForMicChange('model precision preference changed');
+      } else if (e.key == defs.wakeWordVerificationEnabled.key ||
+          e.key == defs.wakeWordVerificationEndpointId.key ||
+          e.key == defs.haUrl.key || e.key == defs.haToken.key) {
+        final wasVerifying = _verifying;
+        _cancelVerification();
+        if (wasVerifying) {
+          _active = true;
+          unawaited(_sync());
+        }
+        _engine.captureWakeCandidate = _verificationEnabled;
       }
     });
 
@@ -798,6 +850,9 @@ class WakeWordManager extends Manager
             if (config == null) {
               return const CommandResult.fail('invalid wake word config');
             }
+            final wasVerifying = _verifying;
+            _cancelVerification();
+            if (wasVerifying) _active = true;
             // A genuinely new config (different wake word, stop word toggled on)
             // has to reach the engine, and it only reads the config at start.
             // Re-pushing the same config on every page load must NOT restart it,
@@ -851,6 +906,7 @@ class WakeWordManager extends Manager
             'reason': "optional: 'muted' | 'browser', shown to the user",
           },
           handler: (p) async {
+            _cancelVerification();
             if (_released) return const CommandResult.ok();
             _released = true;
             _releaseReason = p['reason'] as String?;
@@ -1034,6 +1090,7 @@ class WakeWordManager extends Manager
               'pre-roll. The card uses this instead of getUserMedia during a '
               'voice turn, so wake -> STT is instant and no speech is clipped.',
           handler: (_) async {
+            _cancelVerification();
             if (!_engine.running) {
               return const CommandResult.fail('engine not running');
             }
@@ -1361,6 +1418,7 @@ class WakeWordManager extends Manager
 
   /// Page-driven resume/suspend (setWakeWordActive).
   void setActive(bool active) {
+    _cancelVerification();
     _active = active;
     log.info(name, active ? 'resumed by page' : 'suspended by page');
     if (active) _resumeTimer?.cancel();
@@ -1401,6 +1459,7 @@ class WakeWordManager extends Manager
   Future<bool> openNativeAudioStream(
     void Function(Uint8List pcm, bool preRoll) onChunk,
   ) async {
+    _cancelVerification();
     if (!_engine.running) return false;
     _nativeAudioSink = onChunk;
     try {
@@ -1423,6 +1482,9 @@ class WakeWordManager extends Manager
   /// the way back up, so the gap is brief; a rare, user- or hotplug-driven
   /// change is worth it.
   Future<void> _restartForMicChange(String reason) async {
+    final wasVerifying = _verifying;
+    _cancelVerification();
+    if (wasVerifying) _active = true;
     final running = _runningEngine;
     if (running == null || !running.running) return;
     log.info(name, '$reason; restarting the engine');
@@ -1451,6 +1513,10 @@ class WakeWordManager extends Manager
     // the wake word toggle had been flipped, without touching the setting.
     final shouldRun =
         enabled && available && !_settings.get(defs.lockdownEnabled);
+    if (!shouldRun && _verifying) {
+      _cancelVerification();
+      _active = true;
+    }
     // A config that switched runners (vsWakeWord -> microWakeWord) leaves the
     // previous engine running and holding the mic. Stop it before starting the
     // new one, or two engines fight over the microphone.
@@ -1463,6 +1529,7 @@ class WakeWordManager extends Manager
       _runningEngine = null;
     }
     if (shouldRun && !_engine.running) {
+      _engine.captureWakeCandidate = _verificationEnabled;
       await _engine.start(
         config: _config!,
         onDetection: _onDetection,
@@ -1561,13 +1628,75 @@ class WakeWordManager extends Manager
     }
   }
 
+  Future<bool> _rejectLostHandoff() async {
+    final error = _engine.wakeHandoffError;
+    if (error == null) return false;
+    log.error(name, error);
+    _lastVerification = {
+      ...?_lastVerification,
+      'accepted': false,
+      'reason': 'handoff_overflow',
+    };
+    _engine.clearWakeHandoff();
+    _active = true;
+    await _sync();
+    return true;
+  }
+
   Future<void> _onDetection(
     WakeWordModelRef model, {
     bool simulated = false,
   }) async {
+    // A training/test recording may have opened just before this queued hit.
+    // It must neither reach the verifier nor start a voice turn.
+    if (_testers > 0) {
+      _engine.clearWakeHandoff();
+      if (_active && !_intercomHold) await _engine.resumeDetection();
+      return;
+    }
+    if (!simulated && _verificationEnabled) {
+      // The engine pinned the command handoff and paused detection before
+      // calling us. Copying the candidate already ended at detectionSample.
+      _active = false;
+      _verifying = true;
+      final epoch = ++_verificationEpoch;
+      final candidate = _engine.takeWakeCandidate();
+      final decision = await _verificationGate.check(candidate, (pcm) async {
+        final reply = await _verifier.verify(
+          homeAssistantUrl: _settings.get(defs.haUrl),
+          token: _settings.get(defs.haToken),
+          endpointId: _settings.get(defs.wakeWordVerificationEndpointId),
+          pcm: pcm,
+        );
+        return WakeVerificationDecision(
+          reply.accepted, reply.reason, reply.elapsedMs);
+      });
+      if (epoch != _verificationEpoch) return;
+      _verifying = false;
+      if (_testers > 0) {
+        _engine.clearWakeHandoff();
+        _active = true;
+        await _sync();
+        return;
+      }
+      _lastVerification = {
+        'accepted': decision.accepted,
+        'reason': decision.reason,
+        'elapsedMs': decision.elapsedMs,
+      };
+      log.info(name, 'wake verification ${decision.accepted ? 'accepted' : 'rejected'} '
+          '(${decision.reason}, ${decision.elapsedMs} ms)');
+      if (!decision.accepted) {
+        _engine.clearWakeHandoff();
+        _active = true;
+        await _sync();
+        return;
+      }
+    }
     // The engine has already paused detection and kept the mic — it is the
     // audio source for the turn the page is about to run.
     _active = false;
+    if (_verificationEnabled && await _rejectLostHandoff()) return;
     log.info(name, 'detected "${model.id}"');
     // Before any await: the clip must end at the detection, not wherever
     // the mic has got to once the screen is on.
@@ -1590,6 +1719,7 @@ class WakeWordManager extends Manager
     // no-op when the socket is already up, so foreground wakes pay nothing; the
     // deferred audio is in the pre-roll, so the short wait loses no speech.
     await commands.execute('ensureHaConnected', const {});
+    if (_verificationEnabled && await _rejectLostHandoff()) return;
     bus.publish(WakeWordDetected(model: model.id, phrase: model.wakeWord));
 
     // Self-heal: if the page never resumes us (crash, navigation), re-arm.
@@ -1606,7 +1736,11 @@ class WakeWordManager extends Manager
           engine: _config?.engine.label ?? '',
           pcm: pcm,
           // A simulated wake has no score; the engine's is an older one.
-          detection: simulated ? null : _engine.lastDetection,
+          detection: simulated ? null : {
+            ...?_engine.lastDetection,
+            if (_verificationEnabled && _lastVerification != null)
+              'verification': _lastVerification,
+          },
         )
         .then(
           (_) {},
@@ -1673,6 +1807,8 @@ class WakeWordManager extends Manager
 
   @override
   Future<void> dispose() async {
+    _cancelVerification();
+    _verifier.close();
     WidgetsBinding.instance.removeObserver(this);
     await _backgroundInteractionSub?.cancel();
     _cancelBackgroundReturn();

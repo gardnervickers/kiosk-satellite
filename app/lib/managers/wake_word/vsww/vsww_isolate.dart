@@ -462,6 +462,7 @@ class _IsolateWorker {
           'id': k.id,
           'wakeWord': k.wakeWord,
           'wakeEndSample': wakeEnd,
+          'detectionSample': _absSamples,
           // For the diagnostics log: what the match scored against what it
           // had to clear, and what the model actually heard.
           'score': conf.isFinite ? conf : 0.0,

@@ -45,6 +45,7 @@ dependencies:
 
   # Share sheet (console log export)
   share_plus: ^10.1.4
+  archive: ^4.0.9
 
   # Runtime permissions (mic for Voice Satellite, camera for motion)
   permission_handler: ^11.3.1

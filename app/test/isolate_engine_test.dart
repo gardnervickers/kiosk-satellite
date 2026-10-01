@@ -420,6 +420,30 @@ void main() {
       expect(ByteData.sublistView(chunks.last).getInt16(0, Endian.little), 21);
     });
 
+    test('candidate snapshot and delayed command handoff stay separate', () async {
+      engine.captureWakeCandidate = true;
+      await start();
+      for (var i = 0; i < 40; i++) {
+        await feed(1280, value: i + 1);
+      }
+      await engine.fireDetection(
+          wakeEndSample: 40 * 1280, detectionSample: 40 * 1280);
+      for (var i = 0; i < 12; i++) {
+        await feed(1280, value: 100 + i);
+      }
+      final candidate = engine.takeWakeCandidate()!;
+      expect(candidate.length, 96000);
+      expect(ByteData.sublistView(candidate).getInt16(95998, Endian.little), 40);
+      expect(engine.takeWakeCandidate(), isNull,
+          reason: 'candidate audio is consumed after the decision');
+
+      final command = <Uint8List>[];
+      await engine.startAudioStream((pcm, _) => command.add(pcm));
+      expect(samplesIn(command), 12 * 1280);
+      expect(ByteData.sublistView(command.first).getInt16(0, Endian.little), 100);
+      expect(ByteData.sublistView(command.last).getInt16(0, Endian.little), 111);
+    });
+
     test('failed replay detaches its callback and fails a retry', () async {
       await start();
       await engine.fireDetection(wakeEndSample: 0);
@@ -656,13 +680,14 @@ class _FakeIsolate {
   void crash() =>
       _toMain?.send(['Invalid argument(s): -1', '#0 somewhere (file.dart:1)']);
 
-  void detect({required int? wakeEndSample}) => _toMain?.send({
+  void detect({required int? wakeEndSample, int? detectionSample}) => _toMain?.send({
         'type': WakeMsg.detection,
         'id': 'okay_nabu',
         'wakeWord': 'Okay Nabu',
         // Omitted entirely by an engine that cannot align its match, which is
         // not the same as sending null.
         'wakeEndSample': ?wakeEndSample,
+        'detectionSample': ?detectionSample,
       });
 }
 
@@ -721,8 +746,10 @@ class _FakeEngine extends IsolateWakeEngine {
   }
 
   /// Report a detection exactly as a compute isolate would.
-  Future<void> fireDetection({required int? wakeEndSample}) async {
-    isolate.detect(wakeEndSample: wakeEndSample);
+  Future<void> fireDetection({required int? wakeEndSample,
+      int? detectionSample}) async {
+    isolate.detect(wakeEndSample: wakeEndSample,
+        detectionSample: detectionSample);
     await Future<void>.delayed(const Duration(milliseconds: 2));
   }
 }

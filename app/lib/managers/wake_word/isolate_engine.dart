@@ -93,6 +93,7 @@ class PreRollBuffer {
   }
 
   bool get hasHandoff => _handoff != null;
+  bool get handoffLost => _handoffLost;
 
   void invalidateHandoff() {
     _handoff = <Uint8List>[];
@@ -128,6 +129,39 @@ class PreRollBuffer {
     _chunks.clear();
     _absSamples = 0;
     clearHandoff();
+  }
+}
+
+/// Three-second verifier history on the same sample clock as the detector.
+/// It is distinct from the 640 ms page pre-roll and post-wake handoff.
+@visibleForTesting
+class WakeCandidateBuffer {
+  WakeCandidateBuffer({int initialSample = 0})
+      : _history = PcmRing(64000), _samples = initialSample;
+  final PcmRing _history;
+  int _samples;
+
+  void add(Uint8List pcm) {
+    _history.add(pcm);
+    _samples += pcm.length ~/ 2;
+  }
+
+  Uint8List? at(int detectionSample) {
+    final lag = _samples - detectionSample;
+    if (lag < 0 || lag > _history.capacity - 48000) return null;
+    final available = _history.length - lag;
+    if (available < 0) return null;
+    final count = available < 48000 ? available : 48000;
+    final source = _history.last(count + lag);
+    final out = Uint8List(96000);
+    out.setRange(out.length - count * 2, out.length,
+        source.sublist(0, count * 2));
+    return out;
+  }
+
+  void clear() {
+    _history.clear();
+    _samples = 0;
   }
 }
 
@@ -229,6 +263,38 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
   bool get wakeEndIsAligned => false;
 
   final _preRoll = PreRollBuffer();
+  // Separate from the short page pre-roll and its ten-second command handoff.
+  // Extra room tolerates an isolate result arriving after newer mic chunks.
+  WakeCandidateBuffer? _candidateHistory;
+  Uint8List? _wakeCandidate;
+
+  @override
+  set captureWakeCandidate(bool enabled) {
+    if (enabled == (_candidateHistory != null)) return;
+    _candidateHistory = enabled
+        ? WakeCandidateBuffer(initialSample: _preRoll.absSamples)
+        : null;
+    _wakeCandidate = null;
+  }
+
+  @override
+  Uint8List? takeWakeCandidate() {
+    final candidate = _wakeCandidate;
+    _wakeCandidate = null;
+    return candidate;
+  }
+
+  @override
+  void clearWakeHandoff() {
+    _wakeCandidate = null;
+    _wakeEndSample = null;
+    _preRoll.clearHandoff();
+  }
+
+  @override
+  String? get wakeHandoffError => _preRoll.handoffLost
+      ? 'Wake audio handoff exceeded the buffer; please repeat your request'
+      : null;
 
   bool _running = false;
 
@@ -294,6 +360,9 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
   @override
   Uint8List? recentAudio(Duration length) =>
       _recent?.last(length.inMilliseconds * 16);
+
+  @override
+  void clearRecentAudio() => _recent?.clear();
 
   Map<String, Object?>? _lastDetection;
 
@@ -462,6 +531,7 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
     // classifier keeps the audio flowing even with wake detection paused.
     if (!_detectionPaused || _stopArmed) _isolatePort?.send(bytes);
     _preRoll.add(bytes);
+    _candidateHistory?.add(bytes);
     _recent?.add(bytes);
     // Live stream to the page.
     _onAudioChunk?.call(bytes, false);
@@ -632,6 +702,9 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
       for (final e in msg.entries)
         if (e.key != 'type') '${e.key}': e.value,
     };
+    _wakeCandidate = _candidateHistory?.at(
+      msg['detectionSample'] as int? ?? _preRoll.absSamples,
+    );
     // Fall back to "now": an engine that cannot align its match still must not
     // replay the wake word, and detection never precedes the wake word ending.
     _wakeEndSample = msg['wakeEndSample'] as int? ?? _preRoll.absSamples;
@@ -654,6 +727,7 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
   Future<void> stop() async {
     if (!_running && _isolate == null) return;
     _running = false;
+    _recent?.clear();
     await _audioSub?.cancel();
     _audioSub = null;
 
@@ -680,6 +754,8 @@ abstract class IsolateWakeEngine extends WakeWordEngine {
     _wakeEndSample = null;
     _lastDetection = null;
     _preRoll.reset();
+    _candidateHistory?.clear();
+    _wakeCandidate = null;
     _recent?.clear();
     // The page's audio stream too: left set, the next run would base64 every
     // mic chunk into the bridge for a listener that died with the old page.
