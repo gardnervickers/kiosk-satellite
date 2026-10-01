@@ -280,6 +280,18 @@ void main() {
     );
   });
 
+  test('the default updater checks this fork for releases', () async {
+    final requested = <Uri>[];
+    update.clientFactory = () => MockClient((request) async {
+      requested.add(request.url);
+      return http.Response(release('1.1.0'), 200);
+    });
+    await update.init();
+    expect(await update.check(), isTrue);
+    expect(requested.single.toString(),
+        'https://api.github.com/repos/gardnervickers/kiosk-satellite/releases?per_page=30');
+  });
+
   test('the install downloads the release cut after the notice', () async {
     await notice('1.1.0');
     final asked = <String>[];

@@ -105,7 +105,7 @@ class UpdateManager extends Manager {
   /// window is a display cap, not a paging cursor: a device further behind
   /// than this gets the newest releases and a pointer to the history.
   static const _releasesUrl =
-      'https://api.github.com/repos/jxlarrea/kiosk-satellite/'
+      'https://api.github.com/repos/gardnervickers/kiosk-satellite/'
       'releases?per_page=30';
 
   /// The file a custom repository serves in place of the GitHub query:
