@@ -1800,8 +1800,9 @@ class WakeWordManager extends Manager
     if (_verificationEnabled && await _rejectLostHandoff()) return;
     if (verifiedEpoch != null && verifiedEpoch != _verificationEpoch) return;
     log.info(name, 'detected "${model.id}"');
-    // Before any await: the clip must end at the detection, not wherever
-    // the mic has got to once the screen is on.
+    // Record optional diagnostics before the screen and network waits. This
+    // recent-audio clip is separate from the verifier candidate, which the
+    // engine already snapped at the first detection sample.
     _recordActivation(model, simulated: simulated);
     // A dark panel wakes first, before anything else about the turn:
     // someone spoke to the device, and the UI the turn is about to show
