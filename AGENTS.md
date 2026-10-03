@@ -2,7 +2,7 @@
 
 This repository is Gardner Vickers's fork of Kiosk Satellite. `origin` should be
 `gardnervickers/kiosk-satellite`; upstream is `jxlarrea/kiosk-satellite`. The
-household Portal deployment and configuration live in the separate `nixcfg`
+household Portal deployment and configuration live in the separate `home-infra`
 repository under `services/portal-kiosk/`. Read its `AGENTS.md`,
 `services/portal-kiosk/README.md`, and relevant fleet/voice documentation before
 changing a Portal. Do not treat upstream's generic Portal setup guide as a
@@ -15,7 +15,7 @@ record of the household's current devices or settings.
   inspect their current app version, Android package, signing certificate,
   connection state, and relevant voice behavior first. Never assume every
   Portal is on the same build.
-- Do not run the `nixcfg` provisioning script to update an existing Portal:
+- Do not run the `home-infra` provisioning script to update an existing Portal:
   it installs a pinned upstream APK. Preserve the current launcher, Home
   Assistant identity, remote-admin settings, microphone grant, and all other
   app data where possible. Do not clear app data, uninstall, change the

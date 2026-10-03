@@ -38,12 +38,14 @@ class PreRollChunk {
 /// clock shared with the compute isolate: a detection reports the absolute
 /// sample the wake word ended on, which indexes straight back into here.
 class PreRollBuffer {
-  PreRollBuffer({this.maxChunks = 8, this.maxHandoffSamples = 160000});
+  PreRollBuffer({this.maxChunks = 8, this.maxHandoffSamples = 160000,
+      this.maxRecentSamples});
   // The ordinary ring is 8 x 80 ms = 640 ms. A detected turn may need longer
   // while the page wakes; cap its separate handoff at ten seconds of 16 kHz PCM.
 
   final int maxChunks;
   final int maxHandoffSamples;
+  final int? maxRecentSamples;
   final List<PreRollChunk> _chunks = [];
   int _absSamples = 0;
   List<Uint8List>? _handoff;
@@ -64,7 +66,9 @@ class PreRollBuffer {
         _handoffLost = true;
       }
     }
-    while (_chunks.length > maxChunks) {
+    while (_chunks.length > maxChunks ||
+        (maxRecentSamples != null && _chunks.isNotEmpty &&
+            _absSamples - _chunks.first.startSample > maxRecentSamples!)) {
       _chunks.removeAt(0);
     }
   }

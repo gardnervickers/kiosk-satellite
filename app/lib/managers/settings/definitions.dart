@@ -5183,6 +5183,19 @@ const wakeWordVerificationEnabled = SettingDef<bool>(
   perDevice: true,
 );
 
+/// Per-device pilot for continuous Home Assistant wake detection. The
+/// configured endpoint ID below is shared with wake verification.
+const wakeWordCentralEnabled = SettingDef<bool>(
+  key: 'wake_word.central_enabled',
+  type: SettingType.boolean,
+  defaultValue: false,
+  title: 'Central wake detection',
+  description: 'Stream microphone audio to Home Assistant for wake detection.',
+  category: 'Voice Satellite',
+  hidden: true,
+  perDevice: true,
+);
+
 const wakeWordVerificationEndpointId = SettingDef<String>(
   key: 'wake_word.verification_endpoint_id',
   type: SettingType.string,
@@ -9531,6 +9544,7 @@ const List<SettingDef<Object>> allSettings = [
   wakeWordEnabled,
   wakeWordPreferFp32,
   wakeWordVerificationEnabled,
+  wakeWordCentralEnabled,
   wakeWordVerificationEndpointId,
   wakeWordBackground,
   wakeWordReturnToBackground,

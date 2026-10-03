@@ -13,6 +13,7 @@ import '../audio/mic_level_monitor.dart';
 import '../settings/definitions.dart' as defs;
 import '../settings/settings_manager.dart';
 import 'background_listening.dart';
+import 'central_wake_engine.dart';
 import 'engine.dart';
 import 'model_cache.dart';
 import 'system_permissions.dart';
@@ -59,9 +60,13 @@ class WakeWordManager extends Manager
     super.log,
     this._settings, {
     @visibleForTesting Map<WakeWordEngineType, WakeWordEngine>? engines,
+    @visibleForTesting CentralWakeEngine? centralEngine,
     WakeWordDiagnostics? diagnostics,
     WakeVerifier? verifier,
   }) : _engines = {...?engines},
+       // Public test injection name differs from the private retained field.
+       // ignore: prefer_initializing_formals
+       _centralEngine = centralEngine,
        diagnostics = diagnostics ?? WakeWordDiagnostics(),
        _verifier = verifier ?? WakeVerifier();
 
@@ -78,8 +83,38 @@ class WakeWordManager extends Manager
   bool get _verificationPending => _verifying || _verifiedDispatchPending;
 
   bool get _verificationEnabled =>
+      !_centralEnabled &&
       _settings.get(defs.wakeWordVerificationEnabled) &&
       _config?.engine == WakeWordEngineType.vsWakeWord;
+
+  bool get _centralEnabled => _settings.get(defs.wakeWordCentralEnabled);
+  CentralWakeEngine? _centralEngine;
+  int _centralEpoch = 0;
+  bool _centralDispatchPending = false;
+  CentralWakeEngine get _central => _centralEngine ??= CentralWakeEngine(
+    log,
+    homeAssistantUrl: () => _settings.get(defs.haUrl),
+    token: () => _settings.get(defs.haToken),
+    endpointId: () => _settings.get(defs.wakeWordVerificationEndpointId),
+    onAvailability: (ready) {
+      if (!ready) {
+        _centralEpoch++;
+        if (_centralEnabled && _centralDispatchPending) {
+          _centralDispatchPending = false;
+          _active = true;
+          _centralEngine?.clearWakeHandoff();
+          unawaited(_sync());
+        }
+      }
+      bus.publish(
+        WakeWordStateChanged(
+          active: _active,
+          listening: listening,
+          muted: _muted,
+        ),
+      );
+    },
+  );
 
   void _cancelVerification() {
     _verificationEpoch++;
@@ -121,6 +156,7 @@ class WakeWordManager extends Manager
   /// no config or no native runner for it. Never the *running* engine: see
   /// [_active] handling in [_sync], which stops the outgoing one on a switch.
   WakeWordEngine get _engine {
+    if (_centralEnabled) return _central;
     final config = _config;
     if (config == null) return _noEngine;
     return _engineFor(config.engine) ?? _noEngine;
@@ -275,6 +311,12 @@ class WakeWordManager extends Manager
   /// Reference counted so overlapping testers (device + remote) share one
   /// feed.
   void startTest() {
+    if (_centralDispatchPending) {
+      _centralEpoch++;
+      _centralDispatchPending = false;
+      _centralEngine?.clearWakeHandoff();
+      _active = true;
+    }
     final wasVerifying = _verificationPending;
     _cancelVerification();
     if (wasVerifying) {
@@ -283,12 +325,14 @@ class WakeWordManager extends Manager
     }
     _testers++;
     _applyTelemetry();
+    if (_centralEnabled) unawaited(_sync());
   }
 
   void stopTest() {
     if (_testers == 0) return;
     _testers--;
     _applyTelemetry();
+    if (_centralEnabled) unawaited(_sync());
   }
 
   // Remote mic-level watch. The admin UI cannot hold an in-process
@@ -406,7 +450,8 @@ class WakeWordManager extends Manager
 
   /// Actively detecting. The engine can be running (mic open, models loaded)
   /// while detection is paused for the duration of a voice turn.
-  bool get listening => _engine.running && _active;
+  bool get listening =>
+      _engine.running && _active && (!_centralEnabled || _central.connected);
 
   /// The wake-word config inherited from Voice Satellite (null until the VS
   /// card pushes it via setWakeWordConfig).
@@ -438,7 +483,7 @@ class WakeWordManager extends Manager
   bool get available =>
       enabled &&
       !_released &&
-      !_failed &&
+      (!_failed || _centralEnabled) &&
       _config != null &&
       _engine.supportedEngines.contains(_config!.engine);
 
@@ -636,6 +681,18 @@ class WakeWordManager extends Manager
         ),
       };
     }
+    if (_centralEnabled && !_central.connected) {
+      return (
+        code: 'unavailable',
+        label:
+            'Central wake detection unavailable. Manual Speak remains available.',
+      );
+    }
+    if (_centralEnabled) {
+      return _active && !_intercomHold && _testers == 0
+          ? (code: 'listening', label: 'Listening through Home Assistant')
+          : (code: 'suspended', label: 'Central wake detection paused');
+    }
     if (_failed) {
       return switch (_failure) {
         EngineFailure.micBlocked => (
@@ -745,6 +802,10 @@ class WakeWordManager extends Manager
     },
     'modelPrecision': modelPrecision,
     'wakeVerification': _lastVerification,
+    'centralWake': {
+      'enabled': _centralEnabled,
+      'connected': _centralEnabled && _central.connected,
+    },
   };
 
   @override
@@ -791,6 +852,7 @@ class WakeWordManager extends Manager
         _cancelBackgroundReturn();
       }
       if (e.key == defs.wakeWordEnabled.key ||
+          e.key == defs.wakeWordCentralEnabled.key ||
           e.key == defs.wakeWordBackground.key ||
           e.key == defs.lockdownEnabled.key) {
         _sync();
@@ -832,6 +894,12 @@ class WakeWordManager extends Manager
           unawaited(_sync());
         }
         _engine.captureWakeCandidate = _verificationEnabled;
+        if (_centralEnabled &&
+            (e.key == defs.wakeWordVerificationEndpointId.key ||
+                e.key == defs.haUrl.key ||
+                e.key == defs.haToken.key)) {
+          _restartForMicChange('central wake connection settings changed');
+        }
       }
     });
 
@@ -1449,6 +1517,8 @@ class WakeWordManager extends Manager
   /// or the native satellite standing down.
   Future<void> release(String? reason, {String source = 'page'}) async {
     _cancelVerification();
+    _centralEpoch++;
+    _centralDispatchPending = false;
     if (_released) return;
     _released = true;
     _releaseReason = reason;
@@ -1482,6 +1552,11 @@ class WakeWordManager extends Manager
   /// Page-driven resume/suspend (setWakeWordActive).
   void setActive(bool active) {
     _cancelVerification();
+    if (_centralDispatchPending) {
+      _centralEpoch++;
+      _centralDispatchPending = false;
+      _centralEngine?.clearWakeHandoff();
+    }
     _active = active;
     log.info(name, active ? 'resumed' : 'suspended');
     if (active) _resumeTimer?.cancel();
@@ -1660,7 +1735,7 @@ class WakeWordManager extends Manager
     if (_engine.running) {
       // An intercom call holds detection too: the far voice and the near
       // one both stay out of the assistant, and the page never asked.
-      if (_active && !_intercomHold) {
+      if (_active && !_intercomHold && (!_centralEnabled || _testers == 0)) {
         await _engine.resumeDetection();
       } else {
         await _engine.pauseDetection();
@@ -1731,6 +1806,7 @@ class WakeWordManager extends Manager
       _engine.clearWakeHandoff();
     }
     _active = true;
+    _centralDispatchPending = false;
     await _sync();
     return true;
   }
@@ -1739,6 +1815,7 @@ class WakeWordManager extends Manager
     WakeWordModelRef model, {
     bool simulated = false,
   }) async {
+    final centralEpoch = _centralEnabled && !simulated ? _centralEpoch : null;
     // A training/test recording may have opened just before this queued hit.
     // It must neither reach the verifier nor start a voice turn.
     if (_testers > 0) {
@@ -1797,7 +1874,12 @@ class WakeWordManager extends Manager
     // The engine has already paused detection and kept the mic — it is the
     // audio source for the turn the page is about to run.
     _active = false;
-    if (_verificationEnabled && await _rejectLostHandoff()) return;
+    if (centralEpoch != null) _centralDispatchPending = true;
+    if ((_verificationEnabled || centralEpoch != null) &&
+        await _rejectLostHandoff()) {
+      return;
+    }
+    if (centralEpoch != null && centralEpoch != _centralEpoch) return;
     if (verifiedEpoch != null && verifiedEpoch != _verificationEpoch) return;
     log.info(name, 'detected "${model.id}"');
     // Record optional diagnostics before the screen and network waits. This
@@ -1810,12 +1892,14 @@ class WakeWordManager extends Manager
     // and any other power-off, from the foreground or behind another app
     // alike; a no-op when the panel is already lit.
     await commands.execute('screenOn', const {});
+    if (centralEpoch != null && centralEpoch != _centralEpoch) return;
     if (verifiedEpoch != null && verifiedEpoch != _verificationEpoch) return;
     // Heard from behind another app: come forward, or the turn happens on a
     // page nobody can see. Ordered before the event so the card's UI is on
     // screen by the time it reacts; the audio it will ask us for is already in
     // the pre-roll, so the trip costs nothing.
     await _comeForwardIfBehind();
+    if (centralEpoch != null && centralEpoch != _centralEpoch) return;
     if (verifiedEpoch != null && verifiedEpoch != _verificationEpoch) return;
     // A wake heard from the background may land on a websocket Chromium let die
     // while the WebView was hidden. Make it live and re-subscribed BEFORE Voice
@@ -1824,10 +1908,16 @@ class WakeWordManager extends Manager
     // no-op when the socket is already up, so foreground wakes pay nothing; the
     // deferred audio is in the pre-roll, so the short wait loses no speech.
     await commands.execute('ensureHaConnected', const {});
+    if (centralEpoch != null && centralEpoch != _centralEpoch) return;
     if (verifiedEpoch != null && verifiedEpoch != _verificationEpoch) return;
-    if (_verificationEnabled && await _rejectLostHandoff()) return;
+    if ((_verificationEnabled || centralEpoch != null) &&
+        await _rejectLostHandoff()) {
+      return;
+    }
+    if (centralEpoch != null && centralEpoch != _centralEpoch) return;
     if (verifiedEpoch != null && verifiedEpoch != _verificationEpoch) return;
     _verifiedDispatchPending = false;
+    _centralDispatchPending = false;
     bus.publish(WakeWordDetected(model: model.id, phrase: model.wakeWord));
 
     // Self-heal: if the page never resumes us (crash, navigation), re-arm.
